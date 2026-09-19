@@ -4,87 +4,156 @@ on:
   push:
     branches: [ master ]
 
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-deploy:
     runs-on: self-hosted
 
+    env:
+      AWS_REGION: ap-south-2
+      CONTAINER_NAME: streamlit-container
+
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ap-south-1
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    # Uncomment to debug which identity the SCP is evaluating
+    # - name: Who am I?
+    #   run: aws sts get-caller-identity
 
     - name: Login to Amazon ECR
       id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      uses: aws-actions/amazon-ecr-login@v2
 
     - name: Build, tag, and push image to Amazon ECR
-      id: build-image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
-        # Build the docker image
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        set -euo pipefail
 
-        # Push the docker images
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+        docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
-    - name: Install Nginx
+        docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+        docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+    - name: Ensure Nginx is installed
       run: |
-        # Install Nginx if not installed
+        set -euo pipefail
+
+        # Only touch apt if Nginx is missing (avoids slow/flaky apt on every deploy)
         if ! command -v nginx &> /dev/null; then
           echo "Installing Nginx..."
           sudo apt-get update
           sudo apt-get install -y nginx
         fi
 
-        # Create directories if they don't exist
-        sudo mkdir -p /etc/nginx/sites-available
-        sudo mkdir -p /etc/nginx/sites-enabled
+        sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 
-    - name: Deploy Container
+    - name: Deploy container (with rollback)
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
-        # Stop any existing container
-        docker stop streamlit-container 2>/dev/null || true
-        docker rm streamlit-container 2>/dev/null || true
+        set -euo pipefail
 
-        # Run the container
-        docker run -d --name streamlit-container -p 8501:8501 --restart always $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        NEW_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+        OLD_NAME="${CONTAINER_NAME}-old"
 
-        # Configure Nginx
-        echo "Creating Nginx configuration..."
-        cat > /tmp/streamlit_nginx << 'EOL'
+        # Clean up any leftover backup from a previous failed run
+        docker rm -f "$OLD_NAME" 2>/dev/null || true
+
+        # Keep the current container as a rollback target instead of deleting it
+        HAD_OLD=false
+        if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+          docker stop "$CONTAINER_NAME" >/dev/null
+          docker rename "$CONTAINER_NAME" "$OLD_NAME"
+          docker update --restart=no "$OLD_NAME" >/dev/null
+          HAD_OLD=true
+        fi
+
+        # Bind to localhost only, so traffic must go through Nginx
+        docker run -d \
+          --name "$CONTAINER_NAME" \
+          -p 127.0.0.1:8501:8501 \
+          --restart always \
+          "$NEW_IMAGE"
+
+        # Health check (Streamlit exposes /_stcore/health)
+        echo "Waiting for the new container to become healthy..."
+        HEALTHY=false
+        for i in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:8501/_stcore/health >/dev/null 2>&1; then
+            HEALTHY=true
+            break
+          fi
+          sleep 2
+        done
+
+        if [ "$HEALTHY" != "true" ]; then
+          echo "::error::New container failed health check. Rolling back."
+          docker logs --tail 50 "$CONTAINER_NAME" || true
+          docker rm -f "$CONTAINER_NAME" || true
+          if [ "$HAD_OLD" = "true" ]; then
+            docker rename "$OLD_NAME" "$CONTAINER_NAME"
+            docker update --restart=always "$CONTAINER_NAME" >/dev/null
+            docker start "$CONTAINER_NAME"
+            echo "Rolled back to the previous container."
+          fi
+          exit 1
+        fi
+
+        # Healthy: remove the backup
+        docker rm -f "$OLD_NAME" 2>/dev/null || true
+        echo "Deployed $NEW_IMAGE"
+
+    - name: Configure Nginx
+      run: |
+        set -euo pipefail
+
+        sudo tee /etc/nginx/sites-available/streamlit > /dev/null << 'EOL'
         server {
             listen 80;
             server_name _;
 
             location / {
-                proxy_pass http://localhost:8501;
+                proxy_pass http://127.0.0.1:8501;
                 proxy_http_version 1.1;
                 proxy_set_header Upgrade $http_upgrade;
                 proxy_set_header Connection "upgrade";
                 proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
                 proxy_cache_bypass $http_upgrade;
                 proxy_read_timeout 86400;
             }
         }
         EOL
 
-        sudo cp /tmp/streamlit_nginx /etc/nginx/sites-available/streamlit
-        sudo ln -sf /etc/nginx/sites-available/streamlit /etc/nginx/sites-enabled/
-        sudo rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+        sudo ln -sf /etc/nginx/sites-available/streamlit /etc/nginx/sites-enabled/streamlit
+        sudo rm -f /etc/nginx/sites-enabled/default
+
         sudo nginx -t
-        sudo systemctl restart nginx
+        sudo systemctl enable nginx
+        sudo systemctl reload nginx || sudo systemctl restart nginx
+
+    - name: Prune old images
+      if: success()
+      run: docker image prune -f --filter "until=168h"
