@@ -41,8 +41,11 @@ ai_*.md
 # --- OS / editor -----------------------------------------------------------
 .DS_Store
 .idea/
-.vscode/
 *.swp
+
+# Editor config is shared (pins the venv interpreter); the rest is personal
+.vscode/*
+!.vscode/settings.json
 
 # Note: uv.lock is deliberately NOT ignored — commit it so installs are
 # reproducible. .streamlit/config.toml is also tracked on purpose.

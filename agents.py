@@ -3,18 +3,27 @@ import PyPDF2
 import io
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import RetrievalQA
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import os
 import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Model for every LLM call; override via OPENAI_MODEL in .env
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 class ResumeAnalysisAgent:
-    def __init__(self, api_key, cutoff_score=75):
+    def __init__(self, api_key, cutoff_score=75, model=None):
         self.api_key = api_key
         self.cutoff_score = cutoff_score
+        self.model = model or DEFAULT_MODEL
         self.resume_text = None
         self.rag_vectorstore = None
         self.analysis_result = None
@@ -87,10 +96,22 @@ class ResumeAnalysisAgent:
         vectorstore = FAISS.from_texts([text], embeddings)
         return vectorstore
 
+    def build_retrieval_chain(self, retriever, model=None):
+        """Build an LCEL retrieval chain: invoke with {"input": ...} -> {"answer": ...}"""
+        prompt = ChatPromptTemplate.from_template(
+            "Answer the question using only the context below.\n\n"
+            "Context:\n{context}\n\n"
+            "Question: {input}"
+        )
+        combine_docs_chain = create_stuff_documents_chain(
+            ChatOpenAI(model=model or self.model, api_key=self.api_key), prompt
+        )
+        return create_retrieval_chain(retriever, combine_docs_chain)
+
     def analyze_skill(self, qa_chain, skill):
         """Analyze a skill in the resume"""
         query = f"On a scale of 0-10, how clearly does the candidate mention proficiency in {skill}? Provide a numeric rating first, followed by reasoning."
-        response = qa_chain.run(query)
+        response = qa_chain.invoke({"input": query})["answer"]
         match = re.search(r"(\d{1,2})", response)
         score = int(match.group(1)) if match else 0
 
@@ -115,7 +136,7 @@ class ResumeAnalysisAgent:
 
         for skill in self.analysis_result.get("missing_skills", []):
 
-            llm = ChatOpenAI(model="gpt-4o-mini", api_key=self.api_key)
+            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
             prompt = f"""
                 Analyze why the resume is weak in demonstrating proficiency in "{skill}".
 
@@ -183,7 +204,7 @@ class ResumeAnalysisAgent:
     def extract_skills_from_jd(self, jd_text):
         """Extract skills from a job description"""
         try:
-            llm = ChatOpenAI(model="gpt-4o-mini", api_key=self.api_key)
+            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
             prompt = f"""
                 Extract a comprehensive list of technical skills, technologies, and competencies required from this job description.
                 Format the output as a Python list of strings. Only include the list, nothing else.
@@ -227,11 +248,7 @@ class ResumeAnalysisAgent:
         """Analyze skills semantically"""
         vectorstore = self.create_vector_store(resume_text)
         retriever = vectorstore.as_retriever()
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=ChatOpenAI(model="gpt-4o-mini", api_key=self.api_key),
-            retriever=retriever,
-            return_source_documents=False,
-        )
+        qa_chain = self.build_retrieval_chain(retriever)
 
         skill_scores = {}
         skill_reasoning = {}
@@ -312,15 +329,10 @@ class ResumeAnalysisAgent:
 
         retriever = self.rag_vectorstore.as_retriever(search_kwargs={"k": 3})
 
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=ChatOpenAI(model="gpt-4o-mini", api_key=self.api_key),
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=False,
-        )
+        qa_chain = self.build_retrieval_chain(retriever)
 
-        response = qa_chain.run(question)
-        return response
+        response = qa_chain.invoke({"input": question})
+        return response["answer"]
 
     def generate_interview_questions(self, question_types, difficulty, num_questions):
         """Generate interview questions based on the resume"""
@@ -328,7 +340,7 @@ class ResumeAnalysisAgent:
             return []
 
         try:
-            llm = ChatOpenAI(model="gpt-4o-mini", api_key=self.api_key)
+            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
 
             context = f"""
                 Resume Content:
@@ -461,7 +473,7 @@ class ResumeAnalysisAgent:
             ]
 
             if remaining_areas:
-                llm = ChatOpenAI(model="gpt-4o-mini", api_key=self.api_key)
+                llm = ChatOpenAI(model=self.model, api_key=self.api_key)
 
                 # Create a context with resume analysis and weaknesses
                 weaknesses_text = ""
@@ -633,7 +645,7 @@ class ResumeAnalysisAgent:
                             f"For {skill_name}: {weakness['example']}\n\n"
                         )
 
-            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, api_key=self.api_key)
+            llm = ChatOpenAI(model=self.model, temperature=0.7, api_key=self.api_key)
 
             jd_context = ""
             if self.jd_text:

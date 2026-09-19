@@ -38,7 +38,17 @@ The API key can also be entered in the sidebar at runtime.
 uv run streamlit run app.py
 ```
 
-Opens at http://localhost:8501.
+Opens at http://localhost:8501. Or use the launcher, which works from any
+directory and needs no activation:
+
+```bash
+./run.sh
+```
+
+The venv is pinned in-project via `.vscode/settings.json`
+(`python.defaultInterpreterPath` → `.venv/bin/python`), so editors and their
+integrated terminals pick it up automatically. In a plain terminal, activate
+with `source .venv/bin/activate` or just use `uv run`.
 
 > **Use `uv run`.** A bare `streamlit run app.py` resolves to the system Python,
 > which does not have this project's dependencies installed, and fails with
