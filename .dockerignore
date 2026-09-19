@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# Secrets — must never enter an image layer
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Virtualenv — 921 MB, and built for macOS: it would break a Linux image.
+# Dependencies get installed inside the container from pyproject.toml/uv.lock.
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+
+# ---------------------------------------------------------------------------
+# Python bytecode / build artifacts
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# ---------------------------------------------------------------------------
+# VCS and CI — not needed at runtime
+# ---------------------------------------------------------------------------
+.git/
+.gitignore
+.github/
+.dockerignore
+
+# ---------------------------------------------------------------------------
+# Caches / tests
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+htmlcov/
+.coverage
+
+# ---------------------------------------------------------------------------
+# Editor / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# ---------------------------------------------------------------------------
+# Docs and local tooling
+# ---------------------------------------------------------------------------
+README.md
+Dockerfile
+docker-compose*.yml
+run.sh
+
+# ---------------------------------------------------------------------------
+# Host-side deployment assets. Remove these two lines if your Dockerfile
+# COPYs them into the image (nginx/app.conf is typically mounted by a separate
+# nginx container or lives on the host, not in the app image).
+# ---------------------------------------------------------------------------
+nginx/
+scripts/
+
+# ---------------------------------------------------------------------------
+# Candidate data / generated output
+# ---------------------------------------------------------------------------
+uploads/
+*.pdf
+euron_*.txt
+euron_*.md
+faiss_index/
+*.faiss
+*.pkl
