@@ -4,8 +4,11 @@ aiosignal==1.4.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+argon2-cffi==25.1.0
+argon2-cffi-bindings==26.1.0
 attrs==26.1.0
 certifi==2026.7.22
+cffi==2.1.1
 charset-normalizer==3.5.1
 click==8.5.0
 colorama==0.4.6 ; sys_platform == 'win32'
@@ -46,9 +49,12 @@ orjson==3.12.0
 ormsgpack==1.12.2
 packaging==26.3
 propcache==0.5.4
+pwdlib==0.3.1
+pycparser==3.0 ; implementation_name != 'PyPy'
 pydantic==2.12.5
 pydantic-core==2.41.5
 pydantic-settings==2.15.0
+pyjwt==2.14.0
 pypdf2==3.0.1
 python-dotenv==1.2.3
 python-multipart==0.0.32

@@ -1,6 +1,5 @@
 import io
 import os
-import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -9,25 +8,26 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import (
-    Cookie,
+    APIRouter,
     Depends,
     FastAPI,
     File,
     Form,
     Header,
     HTTPException,
-    Response,
     UploadFile,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import auth
 from agents import ResumeAnalysisAgent
+from auth import User, get_current_user
 
 STATIC_DIR = Path(__file__).parent / "static"
 CUTOFF_SCORE = 75
-SESSION_COOKIE = "session_id"
 SESSION_TTL_SECONDS = 60 * 60
 
 ROLE_REQUIREMENTS = {
@@ -183,8 +183,8 @@ IMPROVEMENT_AREAS = [
 
 
 # --- Sessions ---------------------------------------------------------------
-# Replaces st.session_state: each browser gets a cookie, and its agent (which
-# holds the FAISS index in memory) lives here. This requires a single worker.
+# Replaces st.session_state: each user's agent (which holds the FAISS index in
+# memory) lives here, keyed by user id. This requires a single worker.
 
 
 @dataclass
@@ -195,7 +195,7 @@ class Session:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-_sessions: dict[str, Session] = {}
+_sessions: dict[int, Session] = {}
 _sessions_lock = threading.Lock()
 
 
@@ -208,30 +208,18 @@ def _evict_expired_sessions():
     now = time.monotonic()
     with _sessions_lock:
         expired = [
-            sid for sid, s in _sessions.items() if now - s.last_seen > SESSION_TTL_SECONDS
+            uid for uid, s in _sessions.items() if now - s.last_seen > SESSION_TTL_SECONDS
         ]
-        removed = [_sessions.pop(sid) for sid in expired]
+        removed = [_sessions.pop(uid) for uid in expired]
     for session in removed:
         _cleanup_session(session)
 
 
-def get_session(
-    response: Response, session_id: str | None = Cookie(default=None)
-) -> Session:
+def get_session(user: User = Depends(get_current_user)) -> Session:
     _evict_expired_sessions()
     with _sessions_lock:
-        session = _sessions.get(session_id) if session_id else None
-        if session is None:
-            session_id = secrets.token_urlsafe(32)
-            session = _sessions[session_id] = Session()
+        session = _sessions.setdefault(user.id, Session())
         session.last_seen = time.monotonic()
-    response.set_cookie(
-        SESSION_COOKIE,
-        session_id,
-        httponly=True,
-        samesite="lax",
-        max_age=SESSION_TTL_SECONDS,
-    )
     return session
 
 
@@ -263,6 +251,7 @@ def _extension(upload: UploadFile) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    auth.init_db()
     yield
     with _sessions_lock:
         sessions = list(_sessions.values())
@@ -272,6 +261,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AI Recruitment Agent", version="1.0.0", lifespan=lifespan)
+
+# Origins allowed to call the API from another port/domain (e.g. a React dev
+# server).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        o.strip()
+        for o in os.getenv(
+            "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+        ).split(",")
+        if o.strip()
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --- Request models ---------------------------------------------------------
@@ -299,13 +303,18 @@ class ImprovedResumeRequest(BaseModel):
 
 # --- Routes -----------------------------------------------------------------
 
+app.include_router(auth.router)
+
+# Every route on this router requires a valid bearer token.
+api = APIRouter(prefix="/api", dependencies=[Depends(get_current_user)])
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.get("/api/config")
+@api.get("/config")
 def config():
     return {
         "roles": ROLE_REQUIREMENTS,
@@ -316,7 +325,7 @@ def config():
     }
 
 
-@app.post("/api/analyze")
+@api.post("/analyze")
 def analyze(
     resume: UploadFile = File(...),
     role: str | None = Form(default=None),
@@ -355,13 +364,13 @@ def analyze(
         return result
 
 
-@app.get("/api/analysis")
+@api.get("/analysis")
 def get_analysis(session: Session = Depends(get_session)):
-    """Latest analysis for this session, so a page reload can restore state"""
+    """The user's latest analysis, so a page reload can restore state"""
     return {"analysis_result": session.analysis_result}
 
 
-@app.post("/api/ask")
+@api.post("/ask")
 def ask(
     body: QuestionRequest,
     api_key: str = Depends(get_api_key),
@@ -375,7 +384,7 @@ def ask(
             raise HTTPException(500, f"Error: {e}")
 
 
-@app.post("/api/interview-questions")
+@api.post("/interview-questions")
 def interview_questions(
     body: InterviewQuestionsRequest,
     api_key: str = Depends(get_api_key),
@@ -392,7 +401,7 @@ def interview_questions(
     return {"questions": [{"type": t, "question": q} for t, q in questions]}
 
 
-@app.post("/api/improvements")
+@api.post("/improvements")
 def improvements(
     body: ImprovementsRequest,
     api_key: str = Depends(get_api_key),
@@ -410,7 +419,7 @@ def improvements(
             raise HTTPException(500, f"Error generating improvements: {e}")
 
 
-@app.post("/api/improved-resume")
+@api.post("/improved-resume")
 def improved_resume(
     body: ImprovedResumeRequest,
     api_key: str = Depends(get_api_key),
@@ -426,6 +435,9 @@ def improved_resume(
             }
         except Exception as e:
             raise HTTPException(500, f"Error creating improved resume: {e}")
+
+
+app.include_router(api)
 
 
 @app.get("/", include_in_schema=False)

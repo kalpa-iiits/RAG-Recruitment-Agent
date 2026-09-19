@@ -70,8 +70,14 @@ jobs:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: ${{ github.sha }}
+        JWT_SECRET: ${{ secrets.JWT_SECRET }}
       run: |
         set -euo pipefail
+
+        if [ -z "$JWT_SECRET" ]; then
+          echo "::error::JWT_SECRET repository secret is not set."
+          exit 1
+        fi
 
         NEW_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
         OLD_NAME="${CONTAINER_NAME}-old"
@@ -93,6 +99,8 @@ jobs:
           --name "$CONTAINER_NAME" \
           -p 127.0.0.1:8501:8501 \
           --restart always \
+          -e JWT_SECRET \
+          -v resume-agent-data:/app/data \
           "$NEW_IMAGE"
 
         # Health check (FastAPI exposes /health)

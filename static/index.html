@@ -83,12 +83,34 @@
   .examples button { display: block; width: 100%; text-align: left; margin: 6px 0; }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .chips label { display: inline-flex; align-items: center; gap: 6px; margin: 0; background: var(--field); padding: 6px 10px; border-radius: 15px; cursor: pointer; }
+  .auth-overlay { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .auth-overlay[hidden] { display: none; }
+  .auth-overlay .card { width: 100%; max-width: 380px; }
+  .auth-overlay .actions { display: flex; gap: 12px; margin-top: 16px; }
+  .user-box { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 16px; }
   .downloads { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 16px; }
 </style>
 </head>
 <body>
+<div class="auth-overlay" id="auth-overlay" hidden>
+  <form class="card" id="auth-form">
+    <h2>🚀 AI Recruitment Agent</h2>
+    <p id="auth-mode-label">Sign in to continue</p>
+    <label for="auth-username">Username</label>
+    <input type="text" id="auth-username" autocomplete="username" required>
+    <label for="auth-password">Password</label>
+    <input type="password" id="auth-password" autocomplete="current-password" required>
+    <div id="auth-status"></div>
+    <div class="actions">
+      <button class="btn" type="submit" id="auth-submit">Sign in</button>
+      <button class="btn secondary" type="button" id="auth-toggle">Create account</button>
+    </div>
+  </form>
+</div>
+
 <div class="layout">
   <aside>
+    <div class="user-box"><span>👤 <b id="current-user"></b></span><button class="btn secondary" id="logout-btn">Log out</button></div>
     <h2>Configuration</h2>
     <h3>API Keys</h3>
     <label for="api-key">OpenAI API Key</label>
@@ -235,7 +257,10 @@ const EXAMPLE_QUESTIONS = [
 ];
 
 const $ = (id) => document.getElementById(id);
+const TOKEN_KEY = "access_token";
 let config = null;
+let token = null;
+try { token = localStorage.getItem(TOKEN_KEY); } catch {}
 let analysisResult = null;
 
 function esc(value) {
@@ -261,12 +286,17 @@ async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
   const key = $("api-key").value.trim();
   if (key) headers["X-OpenAI-API-Key"] = key;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   if (options.json !== undefined) {
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(options.json);
   }
-  const res = await fetch(path, { method: options.method || "GET", headers, body: options.body, credentials: "same-origin" });
+  const res = await fetch(path, { method: options.method || "GET", headers, body: options.body });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && token) {
+    setToken(null);
+    showLogin("Your session has expired. Please sign in again.");
+  }
   if (!res.ok) {
     const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("; ") : data.detail;
     throw new Error(detail || `Request failed (${res.status})`);
@@ -502,8 +532,56 @@ $("improved-btn").addEventListener("click", () => {
   });
 });
 
+// --- Auth ------------------------------------------------------------------
+let registering = false;
+
+function setToken(value) {
+  token = value;
+  try { value ? localStorage.setItem(TOKEN_KEY, value) : localStorage.removeItem(TOKEN_KEY); } catch {}
+}
+
+function showLogin(message = "") {
+  $("auth-overlay").hidden = false;
+  showStatus($("auth-status"), message ? "warning" : null, message);
+  $("auth-username").focus();
+}
+
+$("auth-toggle").addEventListener("click", () => {
+  registering = !registering;
+  $("auth-mode-label").textContent = registering ? "Create an account (password: 8+ characters)" : "Sign in to continue";
+  $("auth-submit").textContent = registering ? "Create account" : "Sign in";
+  $("auth-toggle").textContent = registering ? "Back to sign in" : "Create account";
+  $("auth-password").autocomplete = registering ? "new-password" : "current-password";
+  showStatus($("auth-status"), null, "");
+});
+
+$("auth-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const username = $("auth-username").value.trim();
+  const password = $("auth-password").value;
+  withLoading($("auth-submit"), $("auth-status"), registering ? "Creating account..." : "Signing in...", async () => {
+    if (registering) await api("/api/auth/register", { method: "POST", json: { username, password } });
+    const { access_token } = await api("/api/auth/login", {
+      method: "POST", body: new URLSearchParams({ username, password }),
+    });
+    setToken(access_token);
+    $("auth-password").value = "";
+    $("auth-overlay").hidden = true;
+    await start();
+  });
+});
+
+$("logout-btn").addEventListener("click", () => {
+  setToken(null);
+  analysisResult = null;
+  $("analysis-results").innerHTML = "";
+  showLogin();
+});
+
 // --- Init ------------------------------------------------------------------
-(async () => {
+async function start() {
+  const me = await api("/api/auth/me");
+  $("current-user").textContent = me.username;
   config = await api("/api/config");
   $("role").innerHTML = Object.keys(config.roles).map((r) => `<option>${esc(r)}</option>`).join("");
   $("cutoff").textContent = config.cutoff_score;
@@ -514,11 +592,16 @@ $("improved-btn").addEventListener("click", () => {
   chips("improvement-areas", config.improvement_areas, ["Content", "Skills Highlighting"]);
   updateRoleInfo();
 
-  // Restore the session's last analysis after a page reload.
+  // Restore the user's last analysis after a page reload.
   const { analysis_result } = await api("/api/analysis");
-  if (analysis_result) { analysisResult = analysis_result; renderAnalysis(analysisResult); }
+  analysisResult = analysis_result;
+  if (analysisResult) renderAnalysis(analysisResult);
+  else $("analysis-results").innerHTML = "";
   refreshResumeGates();
-})();
+}
+
+if (token) start().catch(() => { if (!token) return; showLogin(); });
+else showLogin();
 </script>
 </body>
 </html>

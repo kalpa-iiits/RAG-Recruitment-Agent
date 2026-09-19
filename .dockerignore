@@ -80,3 +80,5 @@ euron_*.md
 faiss_index/
 *.faiss
 *.pkl
+
+data/

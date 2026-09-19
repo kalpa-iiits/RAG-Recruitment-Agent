@@ -59,30 +59,51 @@ with `source .venv/bin/activate` or just use `uv run`.
 ## How it works
 
 ```
-app.py             FastAPI app — routes, per-browser sessions, role presets
+app.py             FastAPI app — routes, per-user sessions, role presets
+auth.py            accounts (SQLite), password hashing, JWT login
 static/index.html  single-page UI (vanilla JS) that calls the JSON API
 agents.py          ResumeAnalysisAgent — extraction, retrieval, and all LLM calls
 ```
 
-Each browser gets a `session_id` cookie mapped to its own `ResumeAnalysisAgent`,
-which holds the résumé's FAISS index in memory. Sessions expire after an hour
-idle. Because this state is in-process, **run a single worker** (the Dockerfile
+Each logged-in user gets their own `ResumeAnalysisAgent`, which holds the
+résumé's FAISS index in memory. Sessions expire after an hour idle. Because this state is in-process, **run a single worker** (the Dockerfile
 does); multiple workers would each see a different set of sessions.
+
+### Authentication
+
+Accounts live in SQLite at `data/users.db` (override with `DATABASE_PATH`).
+Passwords are hashed with Argon2. Logging in returns a JWT; send it on every
+`/api/*` request as `Authorization: Bearer <token>`. Only `/health`,
+`/api/auth/register` and `/api/auth/login` are public.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `JWT_SECRET` | random per start | Signs tokens. **Set it**, or every restart logs everyone out |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `60` | Token lifetime |
+| `ALLOW_REGISTRATION` | `true` | Set `false` to close sign-ups |
+
+In production the deploy workflow reads `JWT_SECRET` from a repository secret
+and stores the database in the `resume-agent-data` Docker volume so accounts
+survive redeploys.
 
 ### API
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
 | GET | `/health` | — | `{"status": "ok"}` |
+| POST | `/api/auth/register` | `{"username", "password"}` (password 8+ chars) | user |
+| POST | `/api/auth/login` | form-encoded `username`, `password` | `{"access_token", "token_type", "expires_in"}` |
+| GET | `/api/auth/me` | — | `{"id", "username", "created_at"}` |
 | GET | `/api/config` | — | roles, cutoff score, question types, improvement areas |
 | POST | `/api/analyze` | multipart: `resume` (PDF), and `role` or `job_description` (PDF/TXT) | analysis result |
-| GET | `/api/analysis` | — | this session's latest analysis, or `null` |
+| GET | `/api/analysis` | — | this user's latest analysis, or `null` |
 | POST | `/api/ask` | `{"question"}` | `{"answer"}` |
 | POST | `/api/interview-questions` | `{"question_types", "difficulty", "num_questions"}` | `{"questions": [{"type", "question"}]}` |
 | POST | `/api/improvements` | `{"improvement_areas", "target_role"}` | `{"improvements"}` |
 | POST | `/api/improved-resume` | `{"target_role", "highlight_skills"}` | `{"improved_resume"}` |
 
-Everything after `/api/analyze` returns `409` until the session has analysed a résumé.
+Everything after `/api/analyze` returns `409` until the user has analysed a résumé.
+A missing, invalid or expired token returns `401`.
 
 The analysis pipeline in `agents.py`:
 
