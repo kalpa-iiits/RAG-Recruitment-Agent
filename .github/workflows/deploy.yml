@@ -127,7 +127,13 @@ jobs:
       run: |
         set -euo pipefail
 
-        sudo tee /etc/nginx/sites-available/streamlit > /dev/null << 'EOL'
+        CONF=/etc/nginx/sites-available/streamlit
+
+        # Once Certbot has added HTTPS to the config, leave it alone
+        if sudo grep -q "ssl_certificate" "$CONF" 2>/dev/null; then
+          echo "HTTPS config already present; not overwriting $CONF"
+        else
+        sudo tee "$CONF" > /dev/null << 'EOL'
         server {
             listen 80;
             server_name _;
@@ -146,6 +152,7 @@ jobs:
             }
         }
         EOL
+        fi
 
         sudo ln -sf /etc/nginx/sites-available/streamlit /etc/nginx/sites-enabled/streamlit
         sudo rm -f /etc/nginx/sites-enabled/default
