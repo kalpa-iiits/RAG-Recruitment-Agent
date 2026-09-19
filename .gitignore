@@ -1,0 +1,48 @@
+# --- Secrets -------------------------------------------------------------
+# .env holds OPENAI_API_KEY (app.py reads it via load_dotenv)
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# --- Virtual environment -------------------------------------------------
+.venv/
+venv/
+ENV/
+
+# --- Python bytecode / build ---------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# --- Caches / test ---------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Project artifacts -----------------------------------------------------
+# Persisted FAISS indexes (agents.py builds these from uploaded resumes)
+faiss_index/
+*.faiss
+*.pkl
+
+# Resumes / generated reports — candidate data, keep out of version control
+uploads/
+*.pdf
+euron_*.txt
+euron_*.md
+
+# --- OS / editor -----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Note: uv.lock is deliberately NOT ignored — commit it so installs are
+# reproducible. .streamlit/config.toml is also tracked on purpose.

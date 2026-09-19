@@ -1,0 +1,13 @@
+langchain
+langchain-core
+langchain-community
+langchain-openai
+crewai
+streamlit
+openai
+pydantic
+faiss-cpu
+pypdf2
+pandas
+python-dotenv
+matplotlib
