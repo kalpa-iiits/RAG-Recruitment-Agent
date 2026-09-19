@@ -1,4 +1,4 @@
-name: Build and Deploy with Self-hosted Runner
+name: Build and Deploy
 
 on:
   push:
@@ -12,12 +12,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  # Runs on the EC2 instance but does almost nothing, so it's safe on a small box.
+  preflight:
     runs-on: self-hosted
+    outputs:
+      arch: ${{ steps.arch.outputs.arch }}
+    steps:
+    - name: Check required secrets
+      env:
+        JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      run: |
+        if [ -z "$JWT_SECRET" ]; then
+          echo "::error::JWT_SECRET repository secret is not set."
+          exit 1
+        fi
+
+    - name: Detect instance CPU architecture
+      id: arch
+      run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+
+  # Builds on a GitHub-hosted runner: pip-installing numpy/FAISS/LangChain on the
+  # EC2 instance itself ran it out of memory (builds were OOM-killed, exit 137).
+  # The runner matches the instance's architecture so the image runs there.
+  build:
+    needs: preflight
+    runs-on: ${{ needs.preflight.outputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
 
     env:
       AWS_REGION: ap-southeast-2
-      CONTAINER_NAME: streamlit-container
 
     steps:
     - name: Checkout code
@@ -52,6 +74,68 @@ jobs:
         docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
         docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
+    # Keeps storage costs flat: ECR expires everything but the 2 newest images
+    # (the one being deployed and the one before it). Re-applying is a no-op.
+    - name: Cap ECR to the 2 newest images
+      env:
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      run: |
+        if ! aws ecr put-lifecycle-policy \
+          --repository-name "$ECR_REPOSITORY" \
+          --lifecycle-policy-text '{
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep only the 2 newest images",
+              "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 2},
+              "action": {"type": "expire"}
+            }]
+          }' > /dev/null; then
+          echo "::warning::Could not set the ECR lifecycle policy. Grant ecr:PutLifecyclePolicy to the deploy IAM user."
+        fi
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+
+    env:
+      AWS_REGION: ap-southeast-2
+      CONTAINER_NAME: streamlit-container
+
+    steps:
+    - name: Configure AWS credentials (access keys)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Ensure swap is enabled
+      run: |
+        set -euo pipefail
+
+        # Headroom so a memory spike slows the box down instead of OOM-killing it
+        if [ -n "$(swapon --noheadings)" ]; then
+          echo "Swap already enabled:"; swapon --show
+          exit 0
+        fi
+
+        FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+        if [ "$FREE_GB" -lt 4 ]; then
+          echo "::warning::Only ${FREE_GB}G free on /; skipping swap creation."
+          exit 0
+        fi
+
+        sudo fallocate -l 2G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+        swapon --show
+
     - name: Ensure Nginx is installed
       run: |
         set -euo pipefail
@@ -73,11 +157,6 @@ jobs:
         JWT_SECRET: ${{ secrets.JWT_SECRET }}
       run: |
         set -euo pipefail
-
-        if [ -z "$JWT_SECRET" ]; then
-          echo "::error::JWT_SECRET repository secret is not set."
-          exit 1
-        fi
 
         NEW_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
         OLD_NAME="${CONTAINER_NAME}-old"
@@ -169,6 +248,11 @@ jobs:
         sudo systemctl enable nginx
         sudo systemctl reload nginx || sudo systemctl restart nginx
 
+    # Every image is in ECR, so nothing local is worth keeping except what's
+    # running. Also clears build cache left over from when builds ran here.
     - name: Prune old images
       if: success()
-      run: docker image prune -f --filter "until=168h"
+      run: |
+        docker image prune -af
+        docker builder prune -af
+        df -h /
