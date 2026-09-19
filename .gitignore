@@ -35,8 +35,8 @@ faiss_index/
 # Resumes / generated reports — candidate data, keep out of version control
 uploads/
 *.pdf
-euron_*.txt
-euron_*.md
+ai_*.txt
+ai_*.md
 
 # --- OS / editor -----------------------------------------------------------
 .DS_Store

@@ -1,7 +1,7 @@
 import streamlit as st
 
 # This MUST be the first Streamlit command
-st.set_page_config(page_title="Euron Recruitment Agent", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="AI Recruitment Agent", page_icon="🚀", layout="wide")
 
 import ui
 from agents import ResumeAnalysisAgent
