@@ -1,4 +1,4 @@
-# Euron Recruitment Agent
+# AI Recruitment Agent
 
 A Streamlit app that scores a résumé against a target role, then helps improve it.
 Upload a PDF, pick a role (or paste your own job description), and the app returns a
