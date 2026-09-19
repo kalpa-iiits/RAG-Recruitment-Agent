@@ -16,7 +16,7 @@ jobs:
     runs-on: self-hosted
 
     env:
-      AWS_REGION: ap-south-2
+      AWS_REGION: ap-southeast-2
       CONTAINER_NAME: streamlit-container
 
     steps:
