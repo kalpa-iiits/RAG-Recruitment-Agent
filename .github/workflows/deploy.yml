@@ -223,7 +223,7 @@ jobs:
         sudo tee "$CONF" > /dev/null << 'EOL'
         server {
             listen 80;
-            server_name _;
+            server_name api.cvexpert.in;
 
             location / {
                 proxy_pass http://127.0.0.1:8501;
