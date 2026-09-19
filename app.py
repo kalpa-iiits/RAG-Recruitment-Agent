@@ -1,11 +1,34 @@
-import streamlit as st
+import io
+import os
+import secrets
+import threading
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
 
-# This MUST be the first Streamlit command
-st.set_page_config(page_title="AI Recruitment Agent", page_icon="🚀", layout="wide")
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-import ui
 from agents import ResumeAnalysisAgent
-import atexit
+
+STATIC_DIR = Path(__file__).parent / "static"
+CUTOFF_SCORE = 75
+SESSION_COOKIE = "session_id"
+SESSION_TTL_SECONDS = 60 * 60
 
 ROLE_REQUIREMENTS = {
     "AI/ML Engineer": [
@@ -146,198 +169,268 @@ ROLE_REQUIREMENTS = {
     ],
 }
 
-# Initialize session state variables
-if "resume_agent" not in st.session_state:
-    st.session_state.resume_agent = None
+QUESTION_TYPES = ["Basic", "Technical", "Experience", "Scenario", "Coding", "Behavioral"]
+IMPROVEMENT_AREAS = [
+    "Content",
+    "Format",
+    "Skills Highlighting",
+    "Experience Description",
+    "Education",
+    "Projects",
+    "Achievements",
+    "Overall Structure",
+]
 
-if "resume_analyzed" not in st.session_state:
-    st.session_state.resume_analyzed = False
 
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = None
+# --- Sessions ---------------------------------------------------------------
+# Replaces st.session_state: each browser gets a cookie, and its agent (which
+# holds the FAISS index in memory) lives here. This requires a single worker.
 
 
-def setup_agent(config):
-    """Set up the resume analysis agent with the provided configuration"""
-    if not config["openai_api_key"]:
-        st.error("⚠ Please enter your OpenAI API Key in the sidebar.")
-        return None
+@dataclass
+class Session:
+    agent: ResumeAnalysisAgent | None = None
+    analysis_result: dict | None = None
+    last_seen: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
-    # Initialize or update the agent with the API key
-    if st.session_state.resume_agent is None:
-        st.session_state.resume_agent = ResumeAnalysisAgent(
-            api_key=config["openai_api_key"]
+
+_sessions: dict[str, Session] = {}
+_sessions_lock = threading.Lock()
+
+
+def _cleanup_session(session: Session):
+    if session.agent:
+        session.agent.cleanup()
+
+
+def _evict_expired_sessions():
+    now = time.monotonic()
+    with _sessions_lock:
+        expired = [
+            sid for sid, s in _sessions.items() if now - s.last_seen > SESSION_TTL_SECONDS
+        ]
+        removed = [_sessions.pop(sid) for sid in expired]
+    for session in removed:
+        _cleanup_session(session)
+
+
+def get_session(
+    response: Response, session_id: str | None = Cookie(default=None)
+) -> Session:
+    _evict_expired_sessions()
+    with _sessions_lock:
+        session = _sessions.get(session_id) if session_id else None
+        if session is None:
+            session_id = secrets.token_urlsafe(32)
+            session = _sessions[session_id] = Session()
+        session.last_seen = time.monotonic()
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_id,
+        httponly=True,
+        samesite="lax",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return session
+
+
+def get_api_key(x_openai_api_key: str | None = Header(default=None)) -> str:
+    api_key = x_openai_api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(400, "Please enter your OpenAI API Key.")
+    return api_key
+
+
+def require_analyzed(session: Session = Depends(get_session)) -> Session:
+    if not (session.agent and session.analysis_result):
+        raise HTTPException(
+            409, "Please upload and analyze a resume first in the 'Resume Analysis' tab."
         )
-    else:
-        st.session_state.resume_agent.api_key = config["openai_api_key"]
-
-    return st.session_state.resume_agent
+    return session
 
 
-def analyze_resume(agent, resume_file, role, custom_jd):
-    """Analyze the resume with the agent"""
-    if not resume_file:
-        st.error("⚠ Please upload a resume.")
-        return None
+def _to_named_buffer(upload: UploadFile) -> io.BytesIO:
+    """Adapt an upload to the file-like shape agents.py expects (.name + .getvalue())"""
+    buffer = io.BytesIO(upload.file.read())
+    buffer.name = upload.filename or ""
+    return buffer
 
-    try:
-        with st.spinner("🔍 Analyzing resume... This may take a minute."):
-            if custom_jd:
-                result = agent.analyze_resume(resume_file, custom_jd=custom_jd)
-            else:
-                result = agent.analyze_resume(
-                    resume_file, role_requirements=ROLE_REQUIREMENTS[role]
+
+def _extension(upload: UploadFile) -> str:
+    return (upload.filename or "").rsplit(".", 1)[-1].lower()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+        _sessions.clear()
+    for session in sessions:
+        _cleanup_session(session)
+
+
+app = FastAPI(title="AI Recruitment Agent", version="1.0.0", lifespan=lifespan)
+
+
+# --- Request models ---------------------------------------------------------
+
+
+class QuestionRequest(BaseModel):
+    question: str = Field(min_length=1)
+
+
+class InterviewQuestionsRequest(BaseModel):
+    question_types: list[Literal[tuple(QUESTION_TYPES)]] = Field(min_length=1)
+    difficulty: Literal["Easy", "Medium", "Hard"] = "Medium"
+    num_questions: int = Field(default=5, ge=3, le=15)
+
+
+class ImprovementsRequest(BaseModel):
+    improvement_areas: list[Literal[tuple(IMPROVEMENT_AREAS)]] = Field(min_length=1)
+    target_role: str = ""
+
+
+class ImprovedResumeRequest(BaseModel):
+    target_role: str = ""
+    highlight_skills: str = ""
+
+
+# --- Routes -----------------------------------------------------------------
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/config")
+def config():
+    return {
+        "roles": ROLE_REQUIREMENTS,
+        "cutoff_score": CUTOFF_SCORE,
+        "question_types": QUESTION_TYPES,
+        "improvement_areas": IMPROVEMENT_AREAS,
+        "server_has_api_key": bool(os.getenv("OPENAI_API_KEY")),
+    }
+
+
+@app.post("/api/analyze")
+def analyze(
+    resume: UploadFile = File(...),
+    role: str | None = Form(default=None),
+    job_description: UploadFile | None = File(default=None),
+    api_key: str = Depends(get_api_key),
+    session: Session = Depends(get_session),
+):
+    if _extension(resume) != "pdf":
+        raise HTTPException(400, "Resume must be a PDF.")
+    if job_description is not None and _extension(job_description) not in ("pdf", "txt"):
+        raise HTTPException(400, "Job description must be a PDF or TXT file.")
+    if job_description is None and role not in ROLE_REQUIREMENTS:
+        raise HTTPException(400, "Select a valid role or upload a job description.")
+
+    with session.lock:
+        if session.agent is None:
+            session.agent = ResumeAnalysisAgent(api_key=api_key, cutoff_score=CUTOFF_SCORE)
+        else:
+            session.agent.api_key = api_key
+
+        try:
+            if job_description is not None:
+                result = session.agent.analyze_resume(
+                    _to_named_buffer(resume), custom_jd=_to_named_buffer(job_description)
                 )
+            else:
+                result = session.agent.analyze_resume(
+                    _to_named_buffer(resume), role_requirements=ROLE_REQUIREMENTS[role]
+                )
+        except Exception as e:
+            raise HTTPException(500, f"Error analyzing resume: {e}")
 
-            st.session_state.resume_analyzed = True
-            st.session_state.analysis_result = result
-            return result
-    except Exception as e:
-        st.error(f"⚠ Error analyzing resume: {e}")
-        return None
-
-
-def ask_question(agent, question):
-    """Ask a question about the resume"""
-    try:
-        with st.spinner("Generating response..."):
-            response = agent.ask_question(question)
-            return response
-    except Exception as e:
-        return f"Error: {e}"
+        if not result:
+            raise HTTPException(500, "Error analyzing resume: no skills to evaluate.")
+        session.analysis_result = result
+        return result
 
 
-def generate_interview_questions(agent, question_types, difficulty, num_questions):
-    """Generate interview questions based on the resume"""
-    try:
-        with st.spinner("Generating personalized interview questions..."):
-            questions = agent.generate_interview_questions(
-                question_types, difficulty, num_questions
+@app.get("/api/analysis")
+def get_analysis(session: Session = Depends(get_session)):
+    """Latest analysis for this session, so a page reload can restore state"""
+    return {"analysis_result": session.analysis_result}
+
+
+@app.post("/api/ask")
+def ask(
+    body: QuestionRequest,
+    api_key: str = Depends(get_api_key),
+    session: Session = Depends(require_analyzed),
+):
+    with session.lock:
+        session.agent.api_key = api_key
+        try:
+            return {"answer": session.agent.ask_question(body.question)}
+        except Exception as e:
+            raise HTTPException(500, f"Error: {e}")
+
+
+@app.post("/api/interview-questions")
+def interview_questions(
+    body: InterviewQuestionsRequest,
+    api_key: str = Depends(get_api_key),
+    session: Session = Depends(require_analyzed),
+):
+    with session.lock:
+        session.agent.api_key = api_key
+        try:
+            questions = session.agent.generate_interview_questions(
+                body.question_types, body.difficulty, body.num_questions
             )
-            return questions
-    except Exception as e:
-        st.error(f"⚠ Error generating questions: {e}")
-        return []
+        except Exception as e:
+            raise HTTPException(500, f"Error generating questions: {e}")
+    return {"questions": [{"type": t, "question": q} for t, q in questions]}
 
 
-def improve_resume(agent, improvement_areas, target_role):
-    """Generate resume improvement suggestions"""
-    try:
-        with st.spinner("Analyzing and generating improvements..."):
-            return agent.improve_resume(improvement_areas, target_role)
-    except Exception as e:
-        st.error(f"⚠ Error generating improvements: {e}")
-        return {}
+@app.post("/api/improvements")
+def improvements(
+    body: ImprovementsRequest,
+    api_key: str = Depends(get_api_key),
+    session: Session = Depends(require_analyzed),
+):
+    with session.lock:
+        session.agent.api_key = api_key
+        try:
+            return {
+                "improvements": session.agent.improve_resume(
+                    body.improvement_areas, body.target_role
+                )
+            }
+        except Exception as e:
+            raise HTTPException(500, f"Error generating improvements: {e}")
 
 
-def get_improved_resume(agent, target_role, highlight_skills):
-    """Get an improved version of the resume"""
-    try:
-        with st.spinner("Creating improved resume..."):
-            return agent.get_improved_resume(target_role, highlight_skills)
-    except Exception as e:
-        st.error(f"⚠ Error creating improved resume: {e}")
-        return "Error generating improved resume."
+@app.post("/api/improved-resume")
+def improved_resume(
+    body: ImprovedResumeRequest,
+    api_key: str = Depends(get_api_key),
+    session: Session = Depends(require_analyzed),
+):
+    with session.lock:
+        session.agent.api_key = api_key
+        try:
+            return {
+                "improved_resume": session.agent.get_improved_resume(
+                    body.target_role, body.highlight_skills
+                )
+            }
+        except Exception as e:
+            raise HTTPException(500, f"Error creating improved resume: {e}")
 
 
-def cleanup():
-    """Clean up resources when the app exits"""
-    if st.session_state.resume_agent:
-        st.session_state.resume_agent.cleanup()
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
 
 
-# Register cleanup function
-atexit.register(cleanup)
-
-
-def main():
-    # Setup page UI
-    ui.setup_page()
-    ui.display_header()
-
-    # Set up sidebar and get configuration
-    config = ui.setup_sidebar()
-
-    # Set up the agent
-    agent = setup_agent(config)
-
-    # Create tabs for different functionalities
-    tabs = ui.create_tabs()
-
-    # Tab 1: Resume Analysis
-    with tabs[0]:
-        role, custom_jd = ui.role_selection_section(ROLE_REQUIREMENTS)
-        uploaded_resume = ui.resume_upload_section()
-
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
-            if st.button("🔍 Analyze Resume", type="primary"):
-                if agent and uploaded_resume:
-                    # Just store the result, don't display it here
-                    analyze_resume(agent, uploaded_resume, role, custom_jd)
-
-        # Display analysis result (only once)
-        if st.session_state.analysis_result:
-            ui.display_analysis_results(st.session_state.analysis_result)
-
-    # Tab 2: Resume Q&A
-    with tabs[1]:
-        # We need to ensure the agent and resume are available
-        if st.session_state.resume_analyzed and st.session_state.resume_agent:
-            ui.resume_qa_section(
-                has_resume=True,  # Explicitly set to True since we checked above
-                ask_question_func=lambda q: ask_question(
-                    st.session_state.resume_agent, q
-                ),
-            )
-        else:
-            st.warning(
-                "Please upload and analyze a resume first in the 'Resume Analysis' tab."
-            )
-
-    # Tab 3: Interview Questions
-    with tabs[2]:
-        # We need to ensure the agent and resume are available
-        if st.session_state.resume_analyzed and st.session_state.resume_agent:
-            ui.interview_questions_section(
-                has_resume=True,  # Explicitly set to True since we checked above
-                generate_questions_func=lambda types, diff, num: generate_interview_questions(
-                    st.session_state.resume_agent, types, diff, num
-                ),
-            )
-        else:
-            st.warning(
-                "Please upload and analyze a resume first in the 'Resume Analysis' tab."
-            )
-
-    # Tab 4: Resume Improvement
-    with tabs[3]:
-        if st.session_state.resume_analyzed and st.session_state.resume_agent:
-            ui.resume_improvement_section(
-                has_resume=True,
-                improve_resume_func=lambda areas, role: improve_resume(
-                    st.session_state.resume_agent, areas, role
-                ),
-            )
-        else:
-            st.warning(
-                "Please upload and analyze a resume first in the 'Resume Analysis' tab."
-            )
-
-    # Tab 5: Improved Resume
-    with tabs[4]:
-        if st.session_state.resume_analyzed and st.session_state.resume_agent:
-            ui.improved_resume_section(
-                has_resume=True,
-                get_improved_resume_func=lambda role, skills: get_improved_resume(
-                    st.session_state.resume_agent, role, skills
-                ),
-            )
-        else:
-            st.warning(
-                "Please upload and analyze a resume first in the 'Resume Analysis' tab."
-            )
-
-
-if __name__ == "__main__":
-    main()
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

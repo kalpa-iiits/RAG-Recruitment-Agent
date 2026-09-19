@@ -1,6 +1,6 @@
 # AI Recruitment Agent
 
-A Streamlit app that scores a résumé against a target role, then helps improve it.
+A FastAPI app that scores a résumé against a target role, then helps improve it.
 Upload a PDF, pick a role (or paste your own job description), and the app returns a
 0–100 fit score with per-skill breakdown, strengths, missing skills, and concrete
 rewrite suggestions. It also answers free-form questions about the résumé and
@@ -28,18 +28,19 @@ OPENAI_API_KEY = "sk-..."
 OPENAI_MODEL = "gpt-4o-mini"
 ```
 
-The API key can also be entered in the sidebar at runtime.
+The API key can also be entered in the sidebar at runtime; it is sent with each
+request as the `X-OpenAI-API-Key` header and takes precedence over `.env`.
 
 `.env` is gitignored — never commit it.
 
 ## Running
 
 ```bash
-uv run streamlit run app.py
+uv run uvicorn app:app --port 8501 --reload
 ```
 
-Opens at http://localhost:8501. Or use the launcher, which works from any
-directory and needs no activation:
+Opens at http://localhost:8501; interactive API docs are at `/docs`. Or use the
+launcher, which works from any directory and needs no activation:
 
 ```bash
 ./run.sh
@@ -50,7 +51,7 @@ The venv is pinned in-project via `.vscode/settings.json`
 integrated terminals pick it up automatically. In a plain terminal, activate
 with `source .venv/bin/activate` or just use `uv run`.
 
-> **Use `uv run`.** A bare `streamlit run app.py` resolves to the system Python,
+> **Use `uv run`.** A bare `uvicorn app:app` may resolve to the system Python,
 > which does not have this project's dependencies installed, and fails with
 > `ModuleNotFoundError: No module named 'PyPDF2'`. If you prefer the short form,
 > run `source .venv/bin/activate` first so the venv's binaries come first on PATH.
@@ -58,16 +59,30 @@ with `source .venv/bin/activate` or just use `uv run`.
 ## How it works
 
 ```
-app.py      entrypoint — page config, session state, wires callbacks into the UI
-ui.py       presentation only — 12 render functions, no business logic
-agents.py   ResumeAnalysisAgent — extraction, retrieval, and all LLM calls
+app.py             FastAPI app — routes, per-browser sessions, role presets
+static/index.html  single-page UI (vanilla JS) that calls the JSON API
+agents.py          ResumeAnalysisAgent — extraction, retrieval, and all LLM calls
 ```
 
-`ui.py` holds no logic. Each section takes an optional callback
-(`ask_question_func`, `generate_questions_func`, …) that `app.py` supplies as a
-lambda closing over the agent. That keeps rendering testable in isolation and
-means the UI degrades to a warning banner rather than crashing when no résumé has
-been analysed yet.
+Each browser gets a `session_id` cookie mapped to its own `ResumeAnalysisAgent`,
+which holds the résumé's FAISS index in memory. Sessions expire after an hour
+idle. Because this state is in-process, **run a single worker** (the Dockerfile
+does); multiple workers would each see a different set of sessions.
+
+### API
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/health` | — | `{"status": "ok"}` |
+| GET | `/api/config` | — | roles, cutoff score, question types, improvement areas |
+| POST | `/api/analyze` | multipart: `resume` (PDF), and `role` or `job_description` (PDF/TXT) | analysis result |
+| GET | `/api/analysis` | — | this session's latest analysis, or `null` |
+| POST | `/api/ask` | `{"question"}` | `{"answer"}` |
+| POST | `/api/interview-questions` | `{"question_types", "difficulty", "num_questions"}` | `{"questions": [{"type", "question"}]}` |
+| POST | `/api/improvements` | `{"improvement_areas", "target_role"}` | `{"improvements"}` |
+| POST | `/api/improved-resume` | `{"target_role", "highlight_skills"}` | `{"improved_resume"}` |
+
+Everything after `/api/analyze` returns `409` until the session has analysed a résumé.
 
 The analysis pipeline in `agents.py`:
 
@@ -122,4 +137,5 @@ preset list entirely; skills are then extracted from the JD you supply.
   `langchain.chains` will fail. The deprecated `RetrievalQA` is not used.
 - **Candidate data:** uploaded résumés are personal data. `.gitignore` excludes
   `*.pdf` and generated reports; note that `analyze_resume` also writes the
-  extracted text to a temp file, cleaned up by `agent.cleanup()` on exit.
+  extracted text to a temp file, cleaned up by `agent.cleanup()` when the session
+  expires or the server shuts down.

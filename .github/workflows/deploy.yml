@@ -95,11 +95,11 @@ jobs:
           --restart always \
           "$NEW_IMAGE"
 
-        # Health check (Streamlit exposes /_stcore/health)
+        # Health check (FastAPI exposes /health)
         echo "Waiting for the new container to become healthy..."
         HEALTHY=false
         for i in $(seq 1 30); do
-          if curl -fsS http://127.0.0.1:8501/_stcore/health >/dev/null 2>&1; then
+          if curl -fsS http://127.0.0.1:8501/health >/dev/null 2>&1; then
             HEALTHY=true
             break
           fi

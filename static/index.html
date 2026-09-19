@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Recruitment Agent</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>">
+<style>
+  :root { --accent: #d32f2f; --bg: #000; --panel: #111; --field: #222; --text: #fff; --muted: #888; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.5; }
+  .layout { display: flex; min-height: 100vh; }
+  aside { width: 280px; flex-shrink: 0; background: var(--panel); padding: 24px 20px; border-right: 1px solid #222; }
+  main { flex: 1; min-width: 0; padding: 24px 32px 64px; max-width: 1200px; }
+  @media (max-width: 800px) {
+    .layout { flex-direction: column; }
+    aside { width: 100%; border-right: 0; border-bottom: 1px solid #222; }
+    main { padding: 16px; }
+  }
+  h1, h2, h3 { margin: 0 0 12px; }
+  aside h2 { font-size: 1.3rem; }
+  aside h3 { font-size: 1rem; margin-top: 20px; }
+  aside .footer { text-align: center; margin-top: 32px; }
+  aside .footer small { color: #666; }
+  label { display: block; margin: 12px 0 6px; font-size: 0.9rem; }
+  input[type=text], input[type=password], textarea, select {
+    width: 100%; background: var(--field); color: var(--text); border: 1px solid #333; border-radius: 6px; padding: 8px 10px; font: inherit;
+  }
+  textarea { resize: vertical; }
+  input[type=color] { width: 60px; height: 36px; border: 0; background: none; padding: 0; cursor: pointer; }
+  .hint { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
+
+  .main-header { text-align: center; padding: 24px; border-radius: 10px; background: var(--accent); margin-bottom: 24px; }
+  .main-header .logo { font-size: 50px; }
+  .main-header p { margin: 0; }
+
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid #333; margin-bottom: 20px; overflow-x: auto; }
+  .tabs button { background: none; border: 0; border-bottom: 3px solid transparent; color: var(--text); padding: 10px 14px; cursor: pointer; font: inherit; white-space: nowrap; }
+  .tabs button[aria-selected=true] { border-bottom-color: var(--accent); color: var(--accent); }
+  .tab-panel[hidden] { display: none; }
+
+  .card { background: var(--panel); border-radius: 10px; padding: 20px; margin-bottom: 20px; border-left: 4px solid var(--accent); }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-end; }
+  .row > * { flex: 1; min-width: 220px; }
+  .center { text-align: center; }
+
+  .btn { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 10px 18px; font: inherit; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn:hover { filter: brightness(85%); }
+  .btn:disabled { opacity: 0.6; cursor: wait; }
+  .btn.secondary { background: #333; }
+
+  .alert { padding: 12px 16px; border-radius: 6px; margin: 12px 0; }
+  .alert.error, .alert.warning { background: #4a0000; }
+  .alert.info { background: #0b2340; }
+  .alert.success { background: #0d3312; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #555; border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -3px; margin-right: 8px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  hr { border: none; height: 2px; background-image: linear-gradient(to right, black 50%, var(--accent) 50%); margin: 20px 0; }
+  .skill-tag { display: inline-block; background: var(--accent); color: #fff; padding: 5px 12px; border-radius: 15px; margin: 5px; font-weight: bold; }
+  .skill-tag.missing { background: #444; color: #ccc; }
+  .strengths-improvements { display: flex; gap: 20px; flex-wrap: wrap; }
+  .strengths-improvements > div { flex: 1; min-width: 260px; }
+
+  .score-layout { display: flex; gap: 32px; align-items: center; flex-wrap: wrap; }
+  .metric small { color: var(--muted); display: block; }
+  .metric strong { font-size: 2rem; }
+  .donut { width: 200px; height: 200px; }
+  .shortlisted { color: #4CAF50; }
+  .rejected { color: #d32f2f; }
+
+  details { background: #1a1a1a; border-radius: 6px; margin: 8px 0; padding: 0 14px; }
+  details > summary { cursor: pointer; padding: 12px 0; font-weight: 600; }
+  details[open] { padding-bottom: 14px; }
+  .weakness-detail, .solution-detail, .example-detail { padding: 10px 15px; margin: 5px 0; border-radius: 5px; }
+  .weakness-detail { background: #330000; border-left: 3px solid #ff6666; }
+  .solution-detail { background: #003300; border-left: 3px solid #66ff66; }
+  .example-detail { background: #000033; border-left: 3px solid #6666ff; }
+  .comparison-container { display: flex; gap: 20px; margin-top: 15px; flex-wrap: wrap; }
+  .comparison-box { flex: 1; min-width: 240px; background: #333; padding: 15px; border-radius: 5px; }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 8px 0 0; font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }
+  .answer { background: #111122; padding: 15px; border-radius: 5px; border-left: 5px solid var(--accent); margin: 12px 0; white-space: pre-wrap; }
+  .examples button { display: block; width: 100%; text-align: left; margin: 6px 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chips label { display: inline-flex; align-items: center; gap: 6px; margin: 0; background: var(--field); padding: 6px 10px; border-radius: 15px; cursor: pointer; }
+  .downloads { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h2>Configuration</h2>
+    <h3>API Keys</h3>
+    <label for="api-key">OpenAI API Key</label>
+    <input type="password" id="api-key" autocomplete="off">
+    <div class="hint" id="api-key-hint"></div>
+    <hr>
+    <h3>Theme</h3>
+    <label for="accent">Accent Color</label>
+    <input type="color" id="accent" value="#d32f2f">
+    <hr>
+    <div class="footer"><p>AI Recruitment Agent</p><small>v1.0.0</small></div>
+  </aside>
+
+  <main>
+    <div class="main-header">
+      <div class="logo">🚀</div>
+      <h1>AI Recruitment Agent</h1>
+      <p>Smart Resume Analysis &amp; Interview Preparation System</p>
+    </div>
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="analysis">Resume Analysis</button>
+      <button role="tab" aria-selected="false" data-tab="qa">Resume Q&amp;A</button>
+      <button role="tab" aria-selected="false" data-tab="interview">Interview Questions</button>
+      <button role="tab" aria-selected="false" data-tab="improvement">Resume Improvement</button>
+      <button role="tab" aria-selected="false" data-tab="improved">Improved Resume</button>
+    </nav>
+
+    <!-- Tab 1: Resume Analysis -->
+    <section class="tab-panel" id="tab-analysis">
+      <div class="card">
+        <div class="row">
+          <div style="flex:2">
+            <label for="role">Select the role you're applying for:</label>
+            <select id="role"></select>
+          </div>
+          <div>
+            <div class="chips"><label><input type="checkbox" id="use-jd"> Upload custom job description instead</label></div>
+          </div>
+        </div>
+        <div id="jd-upload" hidden>
+          <label for="jd-file">Upload job description (PDF or TXT)</label>
+          <input type="file" id="jd-file" accept=".pdf,.txt">
+        </div>
+        <div id="role-info">
+          <div class="alert info" id="required-skills"></div>
+          <p>Cutoff Score for selection: <b><span id="cutoff"></span>/100</b></p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>📄 Upload Your Resume</h3>
+        <p>Supported format: PDF</p>
+        <input type="file" id="resume-file" accept=".pdf">
+      </div>
+
+      <div class="center"><button class="btn" id="analyze-btn">🔍 Analyze Resume</button></div>
+      <div id="analyze-status"></div>
+      <div id="analysis-results"></div>
+    </section>
+
+    <!-- Tab 2: Resume Q&A -->
+    <section class="tab-panel" id="tab-qa" hidden>
+      <div class="needs-resume"></div>
+      <div class="card requires-resume" hidden>
+        <h3>Ask Questions About the Resume</h3>
+        <form id="qa-form" class="row">
+          <div style="flex:4">
+            <label for="question">Enter your question about the resume:</label>
+            <input type="text" id="question" placeholder="What is the candidate's most recent experience?">
+          </div>
+          <div style="flex:0; min-width:auto"><button class="btn" type="submit">Ask</button></div>
+        </form>
+        <div id="qa-status"></div>
+        <div id="qa-answer"></div>
+        <details class="examples">
+          <summary>Example Questions</summary>
+          <div id="example-questions"></div>
+        </details>
+      </div>
+    </section>
+
+    <!-- Tab 3: Interview Questions -->
+    <section class="tab-panel" id="tab-interview" hidden>
+      <div class="needs-resume"></div>
+      <div class="card requires-resume" hidden>
+        <label>Select question types:</label>
+        <div class="chips" id="question-types"></div>
+        <div class="row">
+          <div>
+            <label for="difficulty">Question difficulty:</label>
+            <select id="difficulty"><option>Easy</option><option selected>Medium</option><option>Hard</option></select>
+          </div>
+          <div>
+            <label for="num-questions">Number of questions: <b id="num-questions-value">5</b></label>
+            <input type="range" id="num-questions" min="3" max="15" value="5" style="width:100%">
+          </div>
+        </div>
+        <p><button class="btn" id="interview-btn">Generate Interview Questions</button></p>
+        <div id="interview-status"></div>
+        <div id="interview-results"></div>
+      </div>
+    </section>
+
+    <!-- Tab 4: Resume Improvement -->
+    <section class="tab-panel" id="tab-improvement" hidden>
+      <div class="needs-resume"></div>
+      <div class="card requires-resume" hidden>
+        <label>Select areas to improve:</label>
+        <div class="chips" id="improvement-areas"></div>
+        <label for="improve-target-role">Target role (optional):</label>
+        <input type="text" id="improve-target-role" placeholder="e.g., Senior Data Scientist at Google">
+        <p><button class="btn" id="improve-btn">Generate Resume Improvements</button></p>
+        <div id="improve-status"></div>
+        <div id="improve-results"></div>
+      </div>
+    </section>
+
+    <!-- Tab 5: Improved Resume -->
+    <section class="tab-panel" id="tab-improved" hidden>
+      <div class="needs-resume"></div>
+      <div class="card requires-resume" hidden>
+        <label for="improved-target-role">Target role:</label>
+        <input type="text" id="improved-target-role" placeholder="e.g., Senior Software Engineer">
+        <label for="highlight-skills">Paste your JD to get updated Resume</label>
+        <textarea id="highlight-skills" rows="5" placeholder="e.g., Python, React, Cloud Architecture"></textarea>
+        <p><button class="btn" id="improved-btn">Generate Improved Resume</button></p>
+        <div id="improved-status"></div>
+        <div id="improved-results"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+const EXAMPLE_QUESTIONS = [
+  "What is the candidate's most recent role?",
+  "How many years of experience does the candidate have with Python?",
+  "What educational qualifications does the candidate have?",
+  "What are the candidate's key achievements?",
+  "Has the candidate managed teams before?",
+  "What projects has the candidate worked on?",
+  "Does the candidate have experience with cloud technologies?",
+];
+
+const $ = (id) => document.getElementById(id);
+let config = null;
+let analysisResult = null;
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+// Escape, then render **bold** (improve_resume emits it for skill names).
+function rich(value) {
+  return esc(value).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+}
+
+function showStatus(el, kind, message) {
+  el.innerHTML = kind === "loading"
+    ? `<div class="alert info"><span class="spinner"></span>${esc(message)}</div>`
+    : message ? `<div class="alert ${kind}">${esc(message)}</div>` : "";
+}
+
+function downloadButton(label, filename, content, mime) {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+  return `<a class="btn" href="${url}" download="${esc(filename)}">${esc(label)}</a>`;
+}
+
+async function api(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  const key = $("api-key").value.trim();
+  if (key) headers["X-OpenAI-API-Key"] = key;
+  if (options.json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(options.json);
+  }
+  const res = await fetch(path, { method: options.method || "GET", headers, body: options.body, credentials: "same-origin" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = Array.isArray(data.detail) ? data.detail.map((d) => d.msg).join("; ") : data.detail;
+    throw new Error(detail || `Request failed (${res.status})`);
+  }
+  return data;
+}
+
+// Run an API call with a disabled button and a spinner in the status element.
+async function withLoading(button, statusEl, message, fn) {
+  button.disabled = true;
+  showStatus(statusEl, "loading", message);
+  try {
+    await fn();
+    showStatus(statusEl, null, "");
+  } catch (err) {
+    showStatus(statusEl, "error", `⚠ ${err.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// --- Tabs & theme ---------------------------------------------------------
+document.querySelectorAll(".tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((b) => b.setAttribute("aria-selected", b === btn));
+    document.querySelectorAll(".tab-panel").forEach((p) => (p.hidden = p.id !== `tab-${btn.dataset.tab}`));
+  });
+});
+$("accent").addEventListener("input", (e) => document.documentElement.style.setProperty("--accent", e.target.value));
+
+function refreshResumeGates() {
+  const ready = Boolean(analysisResult);
+  document.querySelectorAll(".requires-resume").forEach((el) => (el.hidden = !ready));
+  document.querySelectorAll(".needs-resume").forEach((el) => {
+    el.innerHTML = ready ? "" : `<div class="alert warning">Please upload and analyze a resume first in the 'Resume Analysis' tab.</div>`;
+  });
+}
+
+function chips(containerId, options, defaults) {
+  $(containerId).innerHTML = options.map((o) =>
+    `<label><input type="checkbox" value="${esc(o)}" ${defaults.includes(o) ? "checked" : ""}> ${esc(o)}</label>`).join("");
+}
+const checked = (containerId) => [...$(containerId).querySelectorAll("input:checked")].map((i) => i.value);
+
+// --- Tab 1: Resume Analysis ------------------------------------------------
+function updateRoleInfo() {
+  const useJd = $("use-jd").checked;
+  $("jd-upload").hidden = !useJd;
+  $("role-info").hidden = useJd;
+  $("required-skills").textContent = `Required skills: ${config.roles[$("role").value].join(", ")}`;
+}
+$("role").addEventListener("change", updateRoleInfo);
+$("use-jd").addEventListener("change", updateRoleInfo);
+
+$("analyze-btn").addEventListener("click", () => {
+  const status = $("analyze-status");
+  const resume = $("resume-file").files[0];
+  if (!resume) return showStatus(status, "error", "⚠ Please upload a resume.");
+  const form = new FormData();
+  form.append("resume", resume);
+  if ($("use-jd").checked && $("jd-file").files[0]) form.append("job_description", $("jd-file").files[0]);
+  else form.append("role", $("role").value);
+
+  withLoading($("analyze-btn"), status, "🔍 Analyzing resume... This may take a minute.", async () => {
+    analysisResult = await api("/api/analyze", { method: "POST", body: form });
+    renderAnalysis(analysisResult);
+    refreshResumeGates();
+  });
+});
+
+function donut(score) {
+  const r = 70, c = 2 * Math.PI * r, pass = score >= config.cutoff_score;
+  return `<svg class="donut" viewBox="0 0 200 200" role="img" aria-label="Score ${score}%">
+    <circle cx="100" cy="100" r="${r}" fill="none" stroke="#333" stroke-width="40"/>
+    <circle cx="100" cy="100" r="${r}" fill="none" stroke="var(--accent)" stroke-width="40"
+      stroke-dasharray="${(score / 100) * c} ${c}" transform="rotate(-90 100 100)"/>
+    <text x="100" y="100" text-anchor="middle" fill="#fff" font-size="30" font-weight="bold">${score}%</text>
+    <text x="100" y="128" text-anchor="middle" fill="${pass ? "#4CAF50" : "#d32f2f"}" font-size="16" font-weight="bold">${pass ? "PASS" : "FAIL"}</text>
+  </svg>`;
+}
+
+// agents.py sometimes leaves raw JSON in `detail` when parsing fails.
+const cleanDetail = (d) => (!d ? "No specific details provided." : d.startsWith("```json") || d.includes("{") ? "The resume lacks examples of this skill." : d);
+
+function analysisReport(r) {
+  const weaknesses = r.detailed_weaknesses || [];
+  let out = `# AI Recruitment - Resume Analysis Report
+
+## Overall Score: ${r.overall_score}/100
+
+Status: ${r.selected ? "✅ Shortlisted" : "❌ Not Selected"}
+
+## Analysis Reasoning
+${r.reasoning || "No reasoning provided."}
+
+## Strengths
+${(r.strengths?.length ? r.strengths : ["None identified"]).join(", ")}
+
+## Areas for Improvement
+${(r.missing_skills?.length ? r.missing_skills : ["None identified"]).join(", ")}
+
+## Detailed Weakness Analysis
+`;
+  for (const w of weaknesses) {
+    out += `\n### ${w.skill} (Score: ${w.score}/10)\nIssue: ${cleanDetail(w.detail)}\n`;
+    if (w.suggestions?.length) out += "\nImprovement suggestions:\n" + w.suggestions.map((s) => `- ${s}\n`).join("");
+    if (w.example) out += `\nExample: ${w.example}`;
+  }
+  return out + "\n---\nAnalysis provided by AI Recruitment Agent";
+}
+
+function renderAnalysis(r) {
+  const scores = r.skill_scores || {};
+  const tags = (skills, cls) => skills.map((s) => `<span class="skill-tag ${cls}">${esc(s)} (${esc(scores[s] ?? "N/A")}/10)</span>`).join("");
+  const weaknesses = r.detailed_weaknesses || [];
+
+  $("analysis-results").innerHTML = `
+    <div class="card" style="margin-top:20px">
+      <div style="text-align:right; font-size:0.8rem; color:#888">Powered by AI Recruitment</div>
+      <div class="score-layout">
+        <div>
+          <div class="metric"><small>Overall Score</small><strong>${esc(r.overall_score)}/100</strong></div>
+          ${donut(r.overall_score)}
+        </div>
+        <div style="flex:1; min-width:240px">
+          ${r.selected
+            ? `<h2 class="shortlisted">✅ Congratulations! You have been shortlisted.</h2>`
+            : `<h2 class="rejected">❌ Unfortunately, you were not selected.</h2>`}
+          <p>${esc(r.reasoning)}</p>
+        </div>
+      </div>
+      <hr>
+      <div class="strengths-improvements">
+        <div><h3>🌟 Strengths</h3>${r.strengths?.length ? tags(r.strengths, "") : "<p>No notable strengths identified.</p>"}</div>
+        <div><h3>➤ Areas for Improvement</h3>${r.missing_skills?.length ? tags(r.missing_skills, "missing") : "<p>No significant areas for improvement.</p>"}</div>
+      </div>
+      ${weaknesses.length ? `<hr><h3>📊 Detailed Weakness Analysis</h3>` + weaknesses.map((w) => `
+        <details>
+          <summary>${esc(w.skill)} (Score: ${esc(w.score)}/10)</summary>
+          <div class="weakness-detail"><strong>Issue:</strong> ${esc(cleanDetail(w.detail))}</div>
+          ${w.suggestions?.length ? `<strong>How to improve:</strong>` + w.suggestions.map((s, i) => `<div class="solution-detail">${i + 1}. ${esc(s)}</div>`).join("") : ""}
+          ${w.example ? `<strong>Example addition:</strong><div class="example-detail">${esc(w.example)}</div>` : ""}
+        </details>`).join("") : ""}
+      <hr>
+      <div class="downloads">${downloadButton("📊 Download Analysis Report", "ai_resume_analysis.txt", analysisReport(r), "text/plain")}</div>
+    </div>`;
+}
+
+// --- Tab 2: Resume Q&A -----------------------------------------------------
+function askQuestion(question) {
+  if (!question) return;
+  const btn = $("qa-form").querySelector("button");
+  withLoading(btn, $("qa-status"), "Searching resume and generating response...", async () => {
+    const { answer } = await api("/api/ask", { method: "POST", json: { question } });
+    $("qa-answer").innerHTML = `<div class="answer">${esc(answer)}</div>`;
+  });
+}
+$("qa-form").addEventListener("submit", (e) => { e.preventDefault(); askQuestion($("question").value.trim()); });
+$("example-questions").innerHTML = EXAMPLE_QUESTIONS.map((q) => `<button type="button" class="btn secondary">${esc(q)}</button>`).join("");
+$("example-questions").addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  $("question").value = e.target.textContent;
+  askQuestion(e.target.textContent);
+});
+
+// --- Tab 3: Interview Questions -------------------------------------------
+$("num-questions").addEventListener("input", (e) => ($("num-questions-value").textContent = e.target.value));
+$("interview-btn").addEventListener("click", () => {
+  const types = checked("question-types");
+  const difficulty = $("difficulty").value;
+  if (!types.length) return showStatus($("interview-status"), "error", "⚠ Select at least one question type.");
+  withLoading($("interview-btn"), $("interview-status"), "Generating personalized interview questions...", async () => {
+    const { questions } = await api("/api/interview-questions", {
+      method: "POST", json: { question_types: types, difficulty, num_questions: Number($("num-questions").value) },
+    });
+    let md = `# AI Recruitment - Interview Questions\n\nDifficulty: ${difficulty}\nTypes: ${types.join(", ")}\n\n`;
+    const items = questions.map(({ type, question }, i) => {
+      md += `\n\n## ${i + 1}. ${type} Question\n\n${question}\n\n`;
+      if (type === "Coding") md += "```python\n# Write your solution here\n```\n\n";
+      return `<details><summary>${esc(type)}: ${esc(question.slice(0, 50))}...</summary><p>${esc(question)}</p>
+        ${type === "Coding" ? `<pre class="comparison-box"># Write your solution here</pre>` : ""}</details>`;
+    });
+    md += "\n---\nQuestions generated by AI Recruitment Agent";
+    $("interview-results").innerHTML = questions.length
+      ? items.join("") + `<hr><div class="downloads">${downloadButton("📝 Download All Questions", "ai_interview_questions.md", md, "text/markdown")}</div>`
+      : `<div class="alert warning">No questions were generated. Please try again.</div>`;
+  });
+});
+
+// --- Tab 4: Resume Improvement --------------------------------------------
+$("improve-btn").addEventListener("click", () => {
+  const areas = checked("improvement-areas");
+  const targetRole = $("improve-target-role").value.trim();
+  if (!areas.length) return showStatus($("improve-status"), "error", "⚠ Select at least one area to improve.");
+  withLoading($("improve-btn"), $("improve-status"), "Analyzing and generating improvements...", async () => {
+    const { improvements } = await api("/api/improvements", { method: "POST", json: { improvement_areas: areas, target_role: targetRole } });
+    let md = `# AI Recruitment - Resume Improvement Suggestions\n\nTarget Role: ${targetRole || "Not specified"}\n\n`;
+    const html = Object.entries(improvements).map(([area, s]) => {
+      const specific = s.specific || [];
+      md += `## Improvements for ${area}\n\n${s.description || ""}\n\n### Specific Suggestions\n\n`;
+      md += specific.map((x, i) => `${i + 1}. ${x}\n`).join("") + "\n";
+      if (s.before_after) md += `### Before\n\n\`\`\`\n${s.before_after.before}\n\`\`\`\n\n### After\n\n\`\`\`\n${s.before_after.after}\n\`\`\`\n\n`;
+      return `<details open><summary>Improvements for ${esc(area)}</summary>
+        <p>${rich(s.description)}</p>
+        <h4>Specific Suggestions</h4>
+        ${specific.map((x, i) => `<div class="solution-detail"><strong>${i + 1}.</strong> ${rich(x)}</div>`).join("")}
+        ${s.before_after ? `<div class="comparison-container">
+          <div class="comparison-box"><strong>Before:</strong><pre>${esc(s.before_after.before)}</pre></div>
+          <div class="comparison-box"><strong>After:</strong><pre>${esc(s.before_after.after)}</pre></div>
+        </div>` : ""}
+      </details>`;
+    });
+    md += "\n---\nProvided by AI Recruitment Agent";
+    $("improve-results").innerHTML = html.join("") +
+      `<hr><div class="downloads">${downloadButton("📝 Download All Suggestions", "ai_resume_improvements.md", md, "text/markdown")}</div>`;
+  });
+});
+
+// --- Tab 5: Improved Resume ------------------------------------------------
+$("improved-btn").addEventListener("click", () => {
+  const targetRole = $("improved-target-role").value.trim();
+  withLoading($("improved-btn"), $("improved-status"), "Creating improved resume...", async () => {
+    const { improved_resume } = await api("/api/improved-resume", {
+      method: "POST", json: { target_role: targetRole, highlight_skills: $("highlight-skills").value },
+    });
+    const md = `# ${targetRole || "Professional"} Resume\n\n${improved_resume}\n\n---\nResume enhanced by AI Recruitment Agent\n`;
+    $("improved-results").innerHTML = `<h3>Improved Resume</h3>
+      <textarea rows="20" readonly>${esc(improved_resume)}</textarea>
+      <div class="downloads">
+        ${downloadButton("📄 Download as TXT", "ai_improved_resume.txt", improved_resume, "text/plain")}
+        ${downloadButton("📝 Download as Markdown", "ai_improved_resume.md", md, "text/markdown")}
+      </div>`;
+  });
+});
+
+// --- Init ------------------------------------------------------------------
+(async () => {
+  config = await api("/api/config");
+  $("role").innerHTML = Object.keys(config.roles).map((r) => `<option>${esc(r)}</option>`).join("");
+  $("cutoff").textContent = config.cutoff_score;
+  $("api-key-hint").textContent = config.server_has_api_key
+    ? "Optional — the server has a key configured."
+    : "Required to analyze resumes.";
+  chips("question-types", config.question_types, ["Basic", "Technical"]);
+  chips("improvement-areas", config.improvement_areas, ["Content", "Skills Highlighting"]);
+  updateRoleInfo();
+
+  // Restore the session's last analysis after a page reload.
+  const { analysis_result } = await api("/api/analysis");
+  if (analysis_result) { analysisResult = analysis_result; renderAnalysis(analysisResult); }
+  refreshResumeGates();
+})();
+</script>
+</body>
+</html>
