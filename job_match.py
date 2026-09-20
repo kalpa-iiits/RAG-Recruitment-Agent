@@ -5,11 +5,14 @@ alongside any tailored resume generated for that posting. The skill lists and
 the parsed role summary are JSON columns rather than encoded strings.
 """
 
+from collections.abc import Sequence
+
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 import db
+import pagination
 import storage
 from db import session_scope
 
@@ -124,14 +127,79 @@ def create(
         return _to_match(row)
 
 
-def list_matches(user_id: int) -> list[JobMatch]:
+def summaries_for(session, user_id: int, ids: Sequence[int]) -> dict[int, JobMatch]:
+    """Full models for a handful of ids, keyed by id.
+
+    The caller owns the ordering; this only hydrates. Scoped to the user
+    again so a stray id from elsewhere cannot widen what a caller sees.
+    """
+    if not ids:
+        return {}
+    rows = session.scalars(
+        select(db.JobMatch).where(
+            db.JobMatch.id.in_(ids), db.JobMatch.user_id == user_id
+        )
+    ).all()
+    return {row.id: _to_match(row) for row in rows}
+
+
+def _hits(row, needle: str) -> bool:
+    """Same fields the Job Match search box has always matched on."""
+    summary = row.role_summary if isinstance(row.role_summary, dict) else {}
+    haystack = [row.company, row.title, *(summary.get("key_skills") or [])]
+    return any(needle in (text or "").lower() for text in haystack)
+
+
+def list_matches(
+    user_id: int,
+    *,
+    limit: int = pagination.DEFAULT_LIMIT,
+    offset: int = 0,
+    optimized_only: bool = False,
+    q: str = "",
+) -> pagination.Page[JobMatch]:
+    """One page of a user's job matches, most recently updated first.
+
+    Two passes on purpose. The first reads only the columns the filter needs,
+    so the job descriptions and tailored resumes — by far the largest columns
+    on the table — never leave the database. The second hydrates just the
+    rows that made the page, which is where the cost is: every stored PDF on
+    a row gets a presigned link, so that now happens `limit` times per
+    request instead of once per match the user owns.
+    """
+    needle = q.strip().lower()
     with session_scope() as session:
-        rows = session.scalars(
-            select(db.JobMatch)
-            .where(db.JobMatch.user_id == user_id)
-            .order_by(db.JobMatch.updated_at.desc())
+        stmt = select(
+            db.JobMatch.id,
+            db.JobMatch.company,
+            db.JobMatch.title,
+            db.JobMatch.role_summary,
+        ).where(db.JobMatch.user_id == user_id)
+
+        if optimized_only:
+            # Mirrors has_optimized_resume, which treats an empty string as
+            # "nothing generated yet".
+            stmt = stmt.where(
+                db.JobMatch.optimized_resume.is_not(None),
+                db.JobMatch.optimized_resume != "",
+            )
+
+        # id breaks ties so a row cannot drift between pages on equal stamps.
+        rows = session.execute(
+            stmt.order_by(db.JobMatch.updated_at.desc(), db.JobMatch.id.desc())
         ).all()
-        return [_to_match(row) for row in rows]
+
+        if needle:
+            rows = [row for row in rows if _hits(row, needle)]
+
+        page_ids = [row.id for row in rows[offset : offset + limit]]
+        by_id = summaries_for(session, user_id, page_ids)
+        return pagination.Page[JobMatch](
+            items=[by_id[match_id] for match_id in page_ids if match_id in by_id],
+            total=len(rows),
+            limit=limit,
+            offset=offset,
+        )
 
 
 def get_detail(user_id: int, match_id: int) -> JobMatchDetail:

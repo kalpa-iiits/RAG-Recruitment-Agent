@@ -17,7 +17,9 @@ import storage
 from auth import User, get_current_user, password_hash
 from db import session_scope
 
-TEXT_FIELDS = ("full_name", "email", "headline", "location", "linkedin", "website", "about")
+# The account's email is its login identity and lives on the user row, so
+# it is not among the free-text fields the profile form can edit.
+TEXT_FIELDS = ("full_name", "headline", "location", "linkedin", "website", "about")
 
 DEFAULT_PREFERENCES: dict = {
     "email_analysis_complete": True,
@@ -33,10 +35,10 @@ DEFAULT_PREFERENCES: dict = {
 
 
 class Profile(BaseModel):
-    username: str
+    # The address this account signs in with; read-only here.
+    email: str
     member_since: str
     full_name: str = ""
-    email: str = ""
     headline: str = ""
     location: str = ""
     linkedin: str = ""
@@ -48,7 +50,6 @@ class Profile(BaseModel):
 
 class ProfilePatch(BaseModel):
     full_name: str | None = Field(default=None, max_length=120)
-    email: str | None = Field(default=None, max_length=200)
     headline: str | None = Field(default=None, max_length=200)
     location: str | None = Field(default=None, max_length=120)
     linkedin: str | None = Field(default=None, max_length=300)
@@ -92,7 +93,7 @@ def _row(session, user_id: int) -> db.Profile:
 def _to_profile(user: User, row: db.Profile, resume_count: int) -> Profile:
     stored = row.preferences if isinstance(row.preferences, dict) else {}
     return Profile(
-        username=user.username,
+        email=user.email,
         member_since=user.created_at,
         **{field: getattr(row, field) for field in TEXT_FIELDS},
         preferences={**DEFAULT_PREFERENCES, **stored},
@@ -166,13 +167,13 @@ def export_account(user: User = Depends(get_current_user)):
         )
 
     saved = [
-        resume_store.get_detail(user.id, row.id).model_dump()
-        for row in resume_store.list_resumes(user)
+        resume_store.get_detail(user.id, resume_id).model_dump()
+        for resume_id in resume_store.ids_for_user(user.id)
     ]
     return {
         "exported_at": _now(),
         "account": {
-            "username": user.username,
+            "email": user.email,
             "created_at": user.created_at,
         },
         "profile": profile.model_dump(),

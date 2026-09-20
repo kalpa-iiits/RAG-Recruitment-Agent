@@ -32,8 +32,8 @@ if not JWT_SECRET:
     )
 
 password_hash = PasswordHash.recommended()
-# Verified against when the username doesn't exist, so a failed login takes the
-# same time either way and doesn't reveal which usernames are registered.
+# Verified against when the email doesn't exist, so a failed login takes the
+# same time either way and doesn't reveal which addresses are registered.
 _DUMMY_HASH = password_hash.hash(secrets.token_urlsafe(16))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -42,14 +42,20 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 # --- Models -----------------------------------------------------------------
 
 
+# Deliberately permissive: enough to catch a typo or a leftover username,
+# while leaving real deliverability to whatever sends the mail. A stricter
+# grammar would need the email-validator package as a new dependency.
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$"
+
+
 class UserCreate(BaseModel):
-    username: str = Field(min_length=3, max_length=50, pattern=r"^[A-Za-z0-9_.-]+$")
+    email: str = Field(min_length=5, max_length=200, pattern=EMAIL_PATTERN)
     password: str = Field(min_length=8, max_length=128)
 
 
 class User(BaseModel):
     id: int
-    username: str
+    email: str
     created_at: str
 
 
@@ -60,16 +66,16 @@ class Token(BaseModel):
 
 
 def _to_user(row: db.User) -> User:
-    return User(id=row.id, username=row.username, created_at=db.iso(row.created_at))
+    return User(id=row.id, email=row.email, created_at=db.iso(row.created_at))
 
 
 # --- Storage ----------------------------------------------------------------
 
 
-def find_by_username(session, username: str) -> db.User | None:
-    """Case-insensitive, matching the unique index on lower(username)."""
+def find_by_email(session, email: str) -> db.User | None:
+    """Case-insensitive, matching the unique index on lower(email)."""
     return session.scalar(
-        select(db.User).where(func.lower(db.User.username) == username.lower())
+        select(db.User).where(func.lower(db.User.email) == email.strip().lower())
     )
 
 
@@ -107,7 +113,7 @@ def register(body: UserCreate):
     try:
         with session_scope() as session:
             row = db.User(
-                username=body.username,
+                email=body.email.strip(),
                 password_hash=password_hash.hash(body.password),
                 created_at=db.utcnow(),
             )
@@ -115,14 +121,20 @@ def register(body: UserCreate):
             session.flush()
             return _to_user(row)
     except IntegrityError:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Username is already taken.")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "That email is already registered."
+        )
 
 
 @router.post("/login", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends()):
-    """OAuth2 password flow: form-encoded `username` and `password`"""
+    """OAuth2 password flow: form-encoded `username` and `password`.
+
+    The field is named `username` by the OAuth2 spec, which FastAPI's form
+    model follows; what it carries here is the account's email address.
+    """
     with session_scope() as session:
-        row = find_by_username(session, form.username)
+        row = find_by_email(session, form.username)
         stored_hash = row.password_hash if row else _DUMMY_HASH
         user_id = row.id if row else None
 
@@ -130,7 +142,7 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
     if user_id is None or not valid:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
-            "Incorrect username or password",
+            "Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
 

@@ -151,7 +151,9 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    username: Mapped[str] = mapped_column(String(50), nullable=False)
+    # The login identity. Accounts predating email login keep whatever
+    # username they registered with; only new sign-ups must be addresses.
+    email: Mapped[str] = mapped_column(String(200), nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
 
@@ -167,8 +169,8 @@ class User(Base):
 
 
 # Replaces SQLite's `COLLATE NOCASE`, which Postgres does not have. Every
-# lookup by username must go through lower() to use this index.
-Index("uq_users_username_lower", func.lower(User.username), unique=True)
+# lookup by email must go through lower() to use this index.
+Index("uq_users_email_lower", func.lower(User.email), unique=True)
 
 
 class Profile(Base):
@@ -295,8 +297,58 @@ def _add_missing_columns() -> None:
             logger.info("Added column %s.%s", table, name)
 
 
+def _rename_username_to_email() -> None:
+    """Accounts were keyed by a username before login moved to email.
+
+    Renames the column in place rather than adding a second one, so there is
+    only ever one login identity. Existing values carry over untouched: an
+    account registered as "demo" still signs in as "demo" — the address
+    format is only required of new registrations.
+
+    Runs before create_all(), which skips tables that already exist and so
+    would leave the old column in place under a model that no longer has it.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("users"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "email" in columns or "username" not in columns:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX IF EXISTS uq_users_username_lower"))
+        conn.execute(text("ALTER TABLE users RENAME COLUMN username TO email"))
+        if not IS_SQLITE:
+            # SQLite ignores declared lengths; Postgres would hold it at 50.
+            conn.execute(
+                text("ALTER TABLE users ALTER COLUMN email TYPE VARCHAR(200)")
+            )
+    logger.info("Renamed users.username to users.email")
+
+
+def _ensure_email_index() -> None:
+    """Add the unique index to a database that was migrated, not created.
+
+    create_all() builds indexes only alongside a table it creates itself, so
+    a renamed column arrives without one. IF NOT EXISTS rather than an
+    inspector check: SQLite does not report indexes over an expression like
+    lower(email), so a fresh database would look like it were missing one.
+    """
+    if not inspect(engine).has_table("users"):
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower "
+                "ON users (lower(email))"
+            )
+        )
+
+
 def init_db() -> None:
     """Create anything missing. Safe to call on every boot."""
+    _rename_username_to_email()
     Base.metadata.create_all(engine)
     _add_missing_columns()
+    _ensure_email_index()
     logger.info("Database ready: %s", engine.url.render_as_string(hide_password=True))

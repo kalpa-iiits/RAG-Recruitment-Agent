@@ -17,6 +17,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Query,
     UploadFile,
     status,
 )
@@ -28,6 +29,8 @@ from pydantic import BaseModel, Field
 import auth
 import db
 import job_match
+import library
+import pagination
 import pdf
 import profiles
 import resumes
@@ -481,6 +484,7 @@ class ImprovedResumeRequest(BaseModel):
 
 app.include_router(auth.router)
 app.include_router(resumes.router)
+app.include_router(library.router)
 app.include_router(profiles.router)
 
 # Every route on this router requires a valid bearer token.
@@ -645,9 +649,20 @@ def activate_saved_resume(
 # --- Job match --------------------------------------------------------------
 
 
-@api.get("/job-match", response_model=list[job_match.JobMatch])
-def list_job_matches(user: User = Depends(get_current_user)):
-    return job_match.list_matches(user.id)
+@api.get("/job-match", response_model=pagination.Page[job_match.JobMatch])
+def list_job_matches(
+    user: User = Depends(get_current_user),
+    limit: int = Query(pagination.DEFAULT_LIMIT, ge=1, le=pagination.MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    optimized_only: bool = Query(
+        False, description="Only matches that produced a tailored resume."
+    ),
+    q: str = Query("", max_length=200, description="Company, role or key skill."),
+):
+    """One page of the user's job matches, most recently updated first."""
+    return job_match.list_matches(
+        user.id, limit=limit, offset=offset, optimized_only=optimized_only, q=q
+    )
 
 
 @api.get("/job-match/{match_id}", response_model=job_match.JobMatchDetail)
@@ -912,7 +927,9 @@ def get_improved_resume(
     """
     text = session.improved_resume
     download_url = None
-    resume_id = session.saved_resume_id
+    # The session forgets this id on restart and after its TTL, so fall back
+    # to the newest saved resume rather than losing sight of the stored PDF.
+    resume_id = session.saved_resume_id or resumes.latest_id(user.id)
 
     if resume_id:
         try:
@@ -948,6 +965,10 @@ def improved_resume(
         session.improved_resume = improved
         resume_id = session.saved_resume_id
 
+    # Same fallback as the GET: without it a rewrite generated after a restart
+    # is stored nowhere at all, and the download link silently never appears.
+    resume_id = resume_id or resumes.latest_id(user.id)
+
     # Outside the lock: rendering and uploading are slow and touch nothing the
     # session owns. Neither is allowed to cost the user the rewrite itself.
     download_url = None
@@ -964,6 +985,10 @@ def improved_resume(
             download_url = stored_file.url if stored_file else None
         except Exception as e:
             logger.warning("Could not store rewrite for user %s: %s", user.id, e)
+    else:
+        logger.warning(
+            "User %s has no saved resume to attach the rewrite to; not stored.", user.id
+        )
 
     return {
         "improved_resume": improved,

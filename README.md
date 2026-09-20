@@ -62,6 +62,7 @@ with `source .venv/bin/activate` or just use `uv run`.
 app.py             FastAPI app — routes, per-user sessions, role presets
 db.py              engine, session factory and every table (SQLite or Postgres)
 storage.py         resume PDFs in S3 — upload, presigned links, cleanup
+pdf.py             typesets a generated resume into a downloadable PDF
 auth.py            accounts, password hashing, JWT login
 profiles.py        profile fields, preferences, export, account deletion
 resumes.py         saved resumes and their stored analyses
@@ -119,8 +120,21 @@ The database holds the extracted text and the analysis; the original PDF goes
 to S3. Set `S3_BUCKET` to turn it on — with it empty, analysis works exactly
 as before and simply keeps no copy of the file.
 
-Objects are written to `<S3_PREFIX>/<user id>/<uuid>.pdf` with AES256
-server-side encryption. The uploaded filename never becomes part of the key
+Four kinds of file are stored, each under `<S3_PREFIX>/<user id>/<kind>/<uuid>.pdf`
+with AES256 server-side encryption:
+
+| Kind | What it is | Written by |
+| --- | --- | --- |
+| `original` | the uploaded resume PDF | `POST /api/analyze` |
+| `job-description` | an uploaded JD, when one is given instead of a role | `POST /api/analyze` |
+| `improved` | the rewrite, typeset to PDF by `pdf.py` | `POST /api/improved-resume` |
+| `tailored` | the job-specific rewrite, typeset to PDF | `POST /api/job-match/{id}/generate` |
+
+Generated resumes arrive as text; `pdf.py` lays them out (headings, bullets,
+bold) before upload. Regenerating replaces the old object rather than leaving
+it orphaned. The UI previews these in place via `PdfPreview`, which embeds the
+presigned URL directly — the file is never proxied through the app. Keeping every kind under one per-user prefix means a single
+sweep still clears an account. The uploaded filename never becomes part of the key
 (it is attacker-controlled); it stays in the `filename` column for display.
 
 Resumes are candidate personal data, so **the bucket should be private**. The
@@ -180,7 +194,8 @@ is also what lets the app run more than one replica.
 | POST | `/api/improved-resume` | `{"target_role", "highlight_skills"}` | `{"improved_resume"}` |
 | GET | `/api/resumes` | — | saved resumes, each with a presigned `resume_url` |
 | GET | `/api/resumes/{id}` | — | one saved resume plus its stored analysis |
-| GET | `/api/resumes/{id}/download` | — | `307` to a signed link, or `404` if no file was stored |
+| GET | `/api/resumes/{id}/download?kind=` | `original` (default), `jd` or `improved` | `307` to a signed link, `404` if absent, `400` for an unknown kind |
+| GET | `/api/job-match/{id}/download` | — | `307` to the tailored resume PDF |
 | PATCH | `/api/resumes/{id}` | `{"filename", "role", "favourite"}` | updated summary |
 | DELETE | `/api/resumes/{id}` | — | `204`, and the S3 object is removed |
 

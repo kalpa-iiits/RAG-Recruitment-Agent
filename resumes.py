@@ -11,13 +11,15 @@ private and a link copied out of a response cannot be shared indefinitely.
 """
 
 import logging
+from collections.abc import Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 import db
+import pagination
 import storage
 from auth import User, get_current_user
 from db import session_scope
@@ -63,7 +65,7 @@ class ResumePatch(BaseModel):
 # --- Helpers ----------------------------------------------------------------
 
 
-def _tags(analysis: dict | None) -> list[str]:
+def tags_for(analysis: dict | None) -> list[str]:
     """Strongest skills first — what the card shows as chips."""
     if not analysis:
         return []
@@ -85,7 +87,7 @@ def _to_summary(row: db.Resume) -> SavedResume:
         overall_score=row.overall_score,
         selected=bool(analysis.get("selected")),
         favourite=bool(row.favourite),
-        tags=_tags(row.analysis),
+        tags=tags_for(row.analysis),
         skill_count=len(analysis.get("skill_scores") or {}),
         resume_url=_link(row.resume_key),
         jd_url=_link(row.jd_key),
@@ -174,6 +176,105 @@ def get_detail(user_id: int, resume_id: int) -> SavedResumeDetail:
         )
 
 
+def latest_id(user_id: int) -> int | None:
+    """The user's most recently analysed resume.
+
+    Used when the in-memory session has forgotten which row it is working on
+    — it holds that id only until the server restarts or the session times
+    out, and a rewrite generated afterwards would otherwise be stored nowhere.
+    """
+    with session_scope() as session:
+        return session.scalar(
+            select(db.Resume.id)
+            .where(db.Resume.user_id == user_id)
+            .order_by(db.Resume.id.desc())
+            .limit(1)
+        )
+
+
+def summaries_for(session, user_id: int, ids: Sequence[int]) -> dict[int, SavedResume]:
+    """Full models for a handful of ids, keyed by id.
+
+    The caller owns the ordering; this only hydrates. Scoped to the user
+    again so a stray id from elsewhere cannot widen what a caller sees.
+    """
+    if not ids:
+        return {}
+    rows = session.scalars(
+        select(db.Resume).where(db.Resume.id.in_(ids), db.Resume.user_id == user_id)
+    ).all()
+    return {row.id: _to_summary(row) for row in rows}
+
+
+def _hits(row, needle: str) -> bool:
+    """Filename, role and skill tags — what the search box has always matched."""
+    haystack = [row.filename, row.role, *tags_for(row.analysis)]
+    return any(needle in (text or "").lower() for text in haystack)
+
+
+def list_page(
+    user_id: int,
+    *,
+    limit: int = pagination.DEFAULT_LIMIT,
+    offset: int = 0,
+    q: str = "",
+) -> pagination.Page[SavedResume]:
+    """One page of saved resumes: favourites first, then most recently updated.
+
+    Two passes on purpose. The first reads only the columns the filter needs,
+    leaving the extracted resume text — the largest column on the table — in
+    the database; the analysis JSON joins it only when there is something to
+    search its skill tags for. The second hydrates just the rows that made
+    the page, which is where the cost is: each row presigns up to three S3
+    links, so that now happens `limit` times per request rather than once per
+    resume the user owns.
+    """
+    needle = q.strip().lower()
+    with session_scope() as session:
+        columns = [db.Resume.id, db.Resume.filename, db.Resume.role]
+        if needle:
+            columns.append(db.Resume.analysis)
+
+        # id breaks ties so a row cannot drift between pages on equal stamps.
+        rows = session.execute(
+            select(*columns)
+            .where(db.Resume.user_id == user_id)
+            .order_by(
+                db.Resume.favourite.desc(),
+                db.Resume.updated_at.desc(),
+                db.Resume.id.desc(),
+            )
+        ).all()
+
+        if needle:
+            rows = [row for row in rows if _hits(row, needle)]
+
+        page_ids = [row.id for row in rows[offset : offset + limit]]
+        by_id = summaries_for(session, user_id, page_ids)
+        return pagination.Page[SavedResume](
+            items=[by_id[rid] for rid in page_ids if rid in by_id],
+            total=len(rows),
+            limit=limit,
+            offset=offset,
+        )
+
+
+def ids_for_user(user_id: int) -> list[int]:
+    """Every saved resume id, newest first.
+
+    For the account export, which wants the whole library rather than a page
+    of it — so it does not go through the paginated listing.
+    """
+    with session_scope() as session:
+        return list(
+            session.scalars(
+                select(db.Resume.id)
+                .where(db.Resume.user_id == user_id)
+                .order_by(db.Resume.updated_at.desc(), db.Resume.id.desc())
+            ).all()
+        )
+
+
 def count_for_user(session, user_id: int) -> int:
     return session.scalar(
         select(func.count()).select_from(db.Resume).where(db.Resume.user_id == user_id)
@@ -185,16 +286,15 @@ def count_for_user(session, user_id: int) -> int:
 router = APIRouter(prefix="/api/resumes", tags=["resumes"])
 
 
-@router.get("", response_model=list[SavedResume])
-def list_resumes(user: User = Depends(get_current_user)):
-    """Favourites first, then most recently updated."""
-    with session_scope() as session:
-        rows = session.scalars(
-            select(db.Resume)
-            .where(db.Resume.user_id == user.id)
-            .order_by(db.Resume.favourite.desc(), db.Resume.updated_at.desc())
-        ).all()
-        return [_to_summary(row) for row in rows]
+@router.get("", response_model=pagination.Page[SavedResume])
+def list_resumes(
+    user: User = Depends(get_current_user),
+    limit: int = Query(pagination.DEFAULT_LIMIT, ge=1, le=pagination.MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    q: str = Query("", max_length=200, description="Filename, role or skill tag."),
+):
+    """One page of saved resumes: favourites first, then most recently updated."""
+    return list_page(user.id, limit=limit, offset=offset, q=q)
 
 
 @router.get("/{resume_id}", response_model=SavedResumeDetail)
