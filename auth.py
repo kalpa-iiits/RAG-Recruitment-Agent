@@ -1,10 +1,7 @@
 import logging
 import os
 import secrets
-import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import jwt
 from dotenv import load_dotenv
@@ -12,14 +9,16 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pwdlib import PasswordHash
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+
+import db
+from db import session_scope
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DATABASE_PATH = Path(
-    os.getenv("DATABASE_PATH", Path(__file__).parent / "data" / "users.db")
-)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 ALLOW_REGISTRATION = os.getenv("ALLOW_REGISTRATION", "true").lower() == "true"
@@ -38,35 +37,6 @@ password_hash = PasswordHash.recommended()
 _DUMMY_HASH = password_hash.hash(secrets.token_urlsafe(16))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
-
-# --- Storage ----------------------------------------------------------------
-
-
-@contextmanager
-def _db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
-
-
-def init_db():
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
 
 
 # --- Models -----------------------------------------------------------------
@@ -89,8 +59,18 @@ class Token(BaseModel):
     expires_in: int
 
 
-def _row_to_user(row: sqlite3.Row) -> User:
-    return User(id=row["id"], username=row["username"], created_at=row["created_at"])
+def _to_user(row: db.User) -> User:
+    return User(id=row.id, username=row.username, created_at=db.iso(row.created_at))
+
+
+# --- Storage ----------------------------------------------------------------
+
+
+def find_by_username(session, username: str) -> db.User | None:
+    """Case-insensitive, matching the unique index on lower(username)."""
+    return session.scalar(
+        select(db.User).where(func.lower(db.User.username) == username.lower())
+    )
 
 
 # --- Dependencies -----------------------------------------------------------
@@ -108,11 +88,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     except (jwt.InvalidTokenError, KeyError, ValueError):
         raise credentials_error
 
-    with _db() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if row is None:
-        raise credentials_error
-    return _row_to_user(row)
+    with session_scope() as session:
+        row = session.get(db.User, user_id)
+        if row is None:
+            raise credentials_error
+        return _to_user(row)
 
 
 # --- Routes -----------------------------------------------------------------
@@ -124,30 +104,30 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 def register(body: UserCreate):
     if not ALLOW_REGISTRATION:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Registration is disabled.")
-    created_at = datetime.now(timezone.utc).isoformat()
     try:
-        with _db() as conn:
-            cursor = conn.execute(
-                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-                (body.username, password_hash.hash(body.password), created_at),
+        with session_scope() as session:
+            row = db.User(
+                username=body.username,
+                password_hash=password_hash.hash(body.password),
+                created_at=db.utcnow(),
             )
-    except sqlite3.IntegrityError:
+            session.add(row)
+            session.flush()
+            return _to_user(row)
+    except IntegrityError:
         raise HTTPException(status.HTTP_409_CONFLICT, "Username is already taken.")
-    return User(id=cursor.lastrowid, username=body.username, created_at=created_at)
 
 
 @router.post("/login", response_model=Token)
 def login(form: OAuth2PasswordRequestForm = Depends()):
     """OAuth2 password flow: form-encoded `username` and `password`"""
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE username = ?", (form.username,)
-        ).fetchone()
+    with session_scope() as session:
+        row = find_by_username(session, form.username)
+        stored_hash = row.password_hash if row else _DUMMY_HASH
+        user_id = row.id if row else None
 
-    valid = password_hash.verify(
-        form.password, row["password_hash"] if row else _DUMMY_HASH
-    )
-    if row is None or not valid:
+    valid = password_hash.verify(form.password, stored_hash)
+    if user_id is None or not valid:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "Incorrect username or password",
@@ -156,7 +136,7 @@ def login(form: OAuth2PasswordRequestForm = Depends()):
 
     expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = jwt.encode(
-        {"sub": str(row["id"]), "exp": datetime.now(timezone.utc) + expires},
+        {"sub": str(user_id), "exp": datetime.now(timezone.utc) + expires},
         JWT_SECRET,
         algorithm=ALGORITHM,
     )

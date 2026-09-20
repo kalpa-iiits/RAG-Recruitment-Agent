@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "boto3>=1.40",
     "faiss-cpu>=1.15.1",
     "fastapi>=0.141.1",
     "langchain>=1.4.1",
@@ -14,11 +15,13 @@ dependencies = [
     "langchain-openai>=1.6.2",
     "langchain-text-splitters>=1.1.2",
     "openai>=2.54.0",
+    "psycopg[binary]>=3.2",
     "pwdlib[argon2]>=0.3.1",
     "pydantic>=2.12.5",
     "pyjwt>=2.14.0",
     "pypdf2>=3.0.1",
     "python-dotenv>=1.2.3",
     "python-multipart>=0.0.32",
+    "sqlalchemy>=2.0.54",
     "uvicorn[standard]>=0.53.0",
 ]

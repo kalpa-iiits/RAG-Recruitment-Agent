@@ -1,62 +1,31 @@
 """Persistent storage for analysed resumes.
 
 The session keeps one analysis in memory and forgets it on restart, so the
-Saved Resumes page needs its own table. Mirrors auth.py's SQLite layout and
-lives in the same database file.
+Saved Resumes page needs its own table. The analysis itself lands in a JSON
+column (JSONB on Postgres) because its shape follows the prompts in
+agents.py; only the fields the list view sorts and filters on are columns.
+
+The original PDF goes to S3 (see storage.py) and the row keeps its key. The
+`resume_url` the API returns is presigned per request, so the bucket stays
+private and a link copied out of a response cannot be shared indefinitely.
 """
 
-import json
 import logging
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 
-from auth import DATABASE_PATH, User, get_current_user
+import db
+import storage
+from auth import User, get_current_user
+from db import session_scope
 
 logger = logging.getLogger(__name__)
 
 # How many skills are shown as tags on a saved-resume card.
 TAG_LIMIT = 8
-
-
-@contextmanager
-def _db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        with conn:
-            yield conn
-    finally:
-        conn.close()
-
-
-def init_db():
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS resumes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT '',
-                resume_text TEXT NOT NULL,
-                analysis_json TEXT,
-                overall_score INTEGER,
-                favourite INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes (user_id, updated_at DESC)"
-        )
 
 
 # --- Models -----------------------------------------------------------------
@@ -71,6 +40,10 @@ class SavedResume(BaseModel):
     favourite: bool
     tags: list[str]
     skill_count: int
+    # Time-limited download links, or None when nothing was stored.
+    resume_url: str | None
+    jd_url: str | None
+    improved_url: str | None
     created_at: str
     updated_at: str
 
@@ -78,6 +51,7 @@ class SavedResume(BaseModel):
 class SavedResumeDetail(SavedResume):
     resume_text: str
     analysis_result: dict | None
+    improved_text: str | None
 
 
 class ResumePatch(BaseModel):
@@ -89,10 +63,6 @@ class ResumePatch(BaseModel):
 # --- Helpers ----------------------------------------------------------------
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _tags(analysis: dict | None) -> list[str]:
     """Strongest skills first — what the card shows as chips."""
     if not analysis:
@@ -102,64 +72,111 @@ def _tags(analysis: dict | None) -> list[str]:
     return [name for name, _ in ordered[:TAG_LIMIT]]
 
 
-def _to_summary(row: sqlite3.Row) -> SavedResume:
-    analysis = json.loads(row["analysis_json"]) if row["analysis_json"] else None
+def _link(key: str | None) -> str | None:
+    return storage.presigned_url(key) if key else None
+
+
+def _to_summary(row: db.Resume) -> SavedResume:
+    analysis = row.analysis or {}
     return SavedResume(
-        id=row["id"],
-        filename=row["filename"],
-        role=row["role"],
-        overall_score=row["overall_score"],
-        selected=bool((analysis or {}).get("selected")),
-        favourite=bool(row["favourite"]),
-        tags=_tags(analysis),
-        skill_count=len((analysis or {}).get("skill_scores") or {}),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        id=row.id,
+        filename=row.filename,
+        role=row.role,
+        overall_score=row.overall_score,
+        selected=bool(analysis.get("selected")),
+        favourite=bool(row.favourite),
+        tags=_tags(row.analysis),
+        skill_count=len(analysis.get("skill_scores") or {}),
+        resume_url=_link(row.resume_key),
+        jd_url=_link(row.jd_key),
+        improved_url=_link(row.improved_key),
+        created_at=db.iso(row.created_at),
+        updated_at=db.iso(row.updated_at),
     )
 
 
-def save_analysis(user_id: int, filename: str, role: str, resume_text: str, analysis: dict) -> int:
-    """Store a freshly analysed resume. Called after every successful analyze."""
-    now = _now()
-    with _db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO resumes
-                (user_id, filename, role, resume_text, analysis_json,
-                 overall_score, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                filename or "resume.pdf",
-                role or "",
-                resume_text or "",
-                json.dumps(analysis),
-                analysis.get("overall_score"),
-                now,
-                now,
-            ),
-        )
-    return cursor.lastrowid
-
-
-def _fetch(conn: sqlite3.Connection, user_id: int, resume_id: int) -> sqlite3.Row:
-    row = conn.execute(
-        "SELECT * FROM resumes WHERE id = ? AND user_id = ?", (resume_id, user_id)
-    ).fetchone()
+def _fetch(session, user_id: int, resume_id: int) -> db.Resume:
+    row = session.scalar(
+        select(db.Resume).where(db.Resume.id == resume_id, db.Resume.user_id == user_id)
+    )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Saved resume not found.")
     return row
 
 
+# --- Storage ----------------------------------------------------------------
+
+
+def save_analysis(
+    user_id: int,
+    filename: str,
+    role: str,
+    resume_text: str,
+    analysis: dict,
+    stored_file: storage.StoredFile | None = None,
+    jd_file: storage.StoredFile | None = None,
+) -> int:
+    """Store a freshly analysed resume. Called after every successful analyze."""
+    now = db.utcnow()
+    with session_scope() as session:
+        row = db.Resume(
+            user_id=user_id,
+            filename=filename or "resume.pdf",
+            role=role or "",
+            resume_text=resume_text or "",
+            analysis=analysis,
+            overall_score=analysis.get("overall_score"),
+            resume_key=stored_file.key if stored_file else None,
+            resume_url=stored_file.url if stored_file else None,
+            jd_key=jd_file.key if jd_file else None,
+            jd_url=jd_file.url if jd_file else None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+        return row.id
+
+
+def attach_improved(
+    user_id: int,
+    resume_id: int,
+    improved_text: str,
+    stored_file: storage.StoredFile | None,
+) -> None:
+    """Record a rewrite against the saved resume it came from.
+
+    Replaces any earlier rewrite, deleting the superseded PDF so regenerating
+    does not leave a trail of orphaned objects in the bucket.
+    """
+    with session_scope() as session:
+        row = _fetch(session, user_id, resume_id)
+        stale_key = row.improved_key if stored_file else None
+
+        row.improved_text = improved_text
+        if stored_file:
+            row.improved_key = stored_file.key
+            row.improved_url = stored_file.url
+        row.updated_at = db.utcnow()
+
+    if stale_key and stored_file and stale_key != stored_file.key:
+        storage.delete(stale_key)
+
+
 def get_detail(user_id: int, resume_id: int) -> SavedResumeDetail:
-    with _db() as conn:
-        row = _fetch(conn, user_id, resume_id)
-    analysis = json.loads(row["analysis_json"]) if row["analysis_json"] else None
-    return SavedResumeDetail(
-        **_to_summary(row).model_dump(),
-        resume_text=row["resume_text"],
-        analysis_result=analysis,
+    with session_scope() as session:
+        row = _fetch(session, user_id, resume_id)
+        return SavedResumeDetail(
+            **_to_summary(row).model_dump(),
+            resume_text=row.resume_text,
+            analysis_result=row.analysis,
+            improved_text=row.improved_text,
+        )
+
+
+def count_for_user(session, user_id: int) -> int:
+    return session.scalar(
+        select(func.count()).select_from(db.Resume).where(db.Resume.user_id == user_id)
     )
 
 
@@ -171,12 +188,13 @@ router = APIRouter(prefix="/api/resumes", tags=["resumes"])
 @router.get("", response_model=list[SavedResume])
 def list_resumes(user: User = Depends(get_current_user)):
     """Favourites first, then most recently updated."""
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM resumes WHERE user_id = ? ORDER BY favourite DESC, updated_at DESC",
-            (user.id,),
-        ).fetchall()
-    return [_to_summary(row) for row in rows]
+    with session_scope() as session:
+        rows = session.scalars(
+            select(db.Resume)
+            .where(db.Resume.user_id == user.id)
+            .order_by(db.Resume.favourite.desc(), db.Resume.updated_at.desc())
+        ).all()
+        return [_to_summary(row) for row in rows]
 
 
 @router.get("/{resume_id}", response_model=SavedResumeDetail)
@@ -189,34 +207,62 @@ def update_resume(
     resume_id: int, body: ResumePatch, user: User = Depends(get_current_user)
 ):
     """Rename, retag the role, or toggle the favourite star."""
-    fields: dict = {}
-    if body.filename is not None:
-        fields["filename"] = body.filename.strip()
-    if body.role is not None:
-        fields["role"] = body.role.strip()
-    if body.favourite is not None:
-        fields["favourite"] = int(body.favourite)
-
-    if not fields:
+    if body.filename is None and body.role is None and body.favourite is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Nothing to update.")
 
-    fields["updated_at"] = _now()
-    assignments = ", ".join(f"{name} = ?" for name in fields)
+    with session_scope() as session:
+        row = _fetch(session, user.id, resume_id)
+        if body.filename is not None:
+            row.filename = body.filename.strip()
+        if body.role is not None:
+            row.role = body.role.strip()
+        if body.favourite is not None:
+            row.favourite = body.favourite
+        row.updated_at = db.utcnow()
+        session.flush()
+        return _to_summary(row)
 
-    with _db() as conn:
-        _fetch(conn, user.id, resume_id)
-        conn.execute(
-            f"UPDATE resumes SET {assignments} WHERE id = ? AND user_id = ?",
-            (*fields.values(), resume_id, user.id),
+
+# Which stored file a download refers to.
+_DOWNLOAD_KINDS = {
+    "original": "resume_key",
+    "jd": "jd_key",
+    "improved": "improved_key",
+}
+
+
+@router.get("/{resume_id}/download")
+def download_resume(
+    resume_id: int,
+    kind: str = "original",
+    user: User = Depends(get_current_user),
+):
+    """Redirect to a freshly signed link for one of this resume's PDFs."""
+    column = _DOWNLOAD_KINDS.get(kind)
+    if column is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"kind must be one of: {', '.join(_DOWNLOAD_KINDS)}.",
         )
-        row = _fetch(conn, user.id, resume_id)
-    return _to_summary(row)
+
+    with session_scope() as session:
+        key = getattr(_fetch(session, user.id, resume_id), column)
+
+    link = _link(key)
+    if not link:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"No stored {kind} file for this resume."
+        )
+    return RedirectResponse(link, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
 @router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_resume(resume_id: int, user: User = Depends(get_current_user)):
-    with _db() as conn:
-        _fetch(conn, user.id, resume_id)
-        conn.execute(
-            "DELETE FROM resumes WHERE id = ? AND user_id = ?", (resume_id, user.id)
-        )
+    with session_scope() as session:
+        row = _fetch(session, user.id, resume_id)
+        keys = [row.resume_key, row.jd_key, row.improved_key]
+        session.delete(row)
+    # After the row is gone: a failed S3 delete leaves an orphan object, which
+    # is recoverable, while the reverse would leave a row pointing at nothing.
+    for key in filter(None, keys):
+        storage.delete(key)

@@ -1,59 +1,17 @@
 """Matching an analysed resume against specific job descriptions.
 
 Each match is stored so the "job-specific resumes" list survives the session,
-alongside any tailored resume generated for that posting.
+alongside any tailored resume generated for that posting. The skill lists and
+the parsed role summary are JSON columns rather than encoded strings.
 """
-
-import json
-import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
-from auth import DATABASE_PATH
-
-
-@contextmanager
-def _db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        with conn:
-            yield conn
-    finally:
-        conn.close()
-
-
-def init_db():
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS job_matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                company TEXT NOT NULL DEFAULT '',
-                title TEXT NOT NULL DEFAULT '',
-                jd_text TEXT NOT NULL,
-                match_score INTEGER NOT NULL DEFAULT 0,
-                matching_skills TEXT NOT NULL DEFAULT '[]',
-                missing_skills TEXT NOT NULL DEFAULT '[]',
-                role_summary TEXT NOT NULL DEFAULT '{}',
-                optimized_resume TEXT,
-                optimized_score INTEGER,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_job_matches_user "
-            "ON job_matches (user_id, updated_at DESC)"
-        )
+import db
+import storage
+from db import session_scope
 
 
 # --- Models -----------------------------------------------------------------
@@ -78,6 +36,8 @@ class JobMatch(BaseModel):
     role_summary: RoleSummary
     has_optimized_resume: bool
     optimized_score: int | None
+    # Time-limited link to the tailored resume PDF.
+    optimized_url: str | None
     created_at: str
     updated_at: str
 
@@ -103,40 +63,38 @@ class JobMatchPatch(BaseModel):
 # --- Helpers ----------------------------------------------------------------
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _loads(raw: str, fallback):
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return fallback
-
-
-def _to_match(row: sqlite3.Row) -> JobMatch:
+def _to_match(row: db.JobMatch) -> JobMatch:
+    summary = row.role_summary if isinstance(row.role_summary, dict) else {}
     return JobMatch(
-        id=row["id"],
-        company=row["company"],
-        title=row["title"],
-        match_score=row["match_score"],
-        matching_skills=_loads(row["matching_skills"], []),
-        missing_skills=_loads(row["missing_skills"], []),
-        role_summary=RoleSummary(**_loads(row["role_summary"], {})),
-        has_optimized_resume=bool(row["optimized_resume"]),
-        optimized_score=row["optimized_score"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        id=row.id,
+        company=row.company,
+        title=row.title,
+        match_score=row.match_score,
+        matching_skills=row.matching_skills or [],
+        missing_skills=row.missing_skills or [],
+        role_summary=RoleSummary(**summary),
+        has_optimized_resume=bool(row.optimized_resume),
+        optimized_score=row.optimized_score,
+        optimized_url=(
+            storage.presigned_url(row.optimized_key) if row.optimized_key else None
+        ),
+        created_at=db.iso(row.created_at),
+        updated_at=db.iso(row.updated_at),
     )
 
 
-def _fetch(conn: sqlite3.Connection, user_id: int, match_id: int) -> sqlite3.Row:
-    row = conn.execute(
-        "SELECT * FROM job_matches WHERE id = ? AND user_id = ?", (match_id, user_id)
-    ).fetchone()
+def _fetch(session, user_id: int, match_id: int) -> db.JobMatch:
+    row = session.scalar(
+        select(db.JobMatch).where(
+            db.JobMatch.id == match_id, db.JobMatch.user_id == user_id
+        )
+    )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job match not found.")
     return row
+
+
+# --- Storage ----------------------------------------------------------------
 
 
 def create(
@@ -147,95 +105,97 @@ def create(
     missing_skills: list[str],
     role_summary: dict,
 ) -> JobMatch:
-    now = _now()
-    with _db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO job_matches
-                (user_id, company, title, jd_text, match_score, matching_skills,
-                 missing_skills, role_summary, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                role_summary.get("company", ""),
-                role_summary.get("title", ""),
-                jd_text,
-                match_score,
-                json.dumps(matching_skills),
-                json.dumps(missing_skills),
-                json.dumps(role_summary),
-                now,
-                now,
-            ),
+    now = db.utcnow()
+    with session_scope() as session:
+        row = db.JobMatch(
+            user_id=user_id,
+            company=role_summary.get("company", ""),
+            title=role_summary.get("title", ""),
+            jd_text=jd_text,
+            match_score=match_score,
+            matching_skills=list(matching_skills),
+            missing_skills=list(missing_skills),
+            role_summary=role_summary,
+            created_at=now,
+            updated_at=now,
         )
-        row = _fetch(conn, user_id, cursor.lastrowid)
-    return _to_match(row)
+        session.add(row)
+        session.flush()
+        return _to_match(row)
 
 
 def list_matches(user_id: int) -> list[JobMatch]:
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM job_matches WHERE user_id = ? ORDER BY updated_at DESC",
-            (user_id,),
-        ).fetchall()
-    return [_to_match(row) for row in rows]
+    with session_scope() as session:
+        rows = session.scalars(
+            select(db.JobMatch)
+            .where(db.JobMatch.user_id == user_id)
+            .order_by(db.JobMatch.updated_at.desc())
+        ).all()
+        return [_to_match(row) for row in rows]
 
 
 def get_detail(user_id: int, match_id: int) -> JobMatchDetail:
-    with _db() as conn:
-        row = _fetch(conn, user_id, match_id)
-    return JobMatchDetail(
-        **_to_match(row).model_dump(),
-        jd_text=row["jd_text"],
-        optimized_resume=row["optimized_resume"],
-    )
-
-
-def store_optimized(user_id: int, match_id: int, resume_text: str, score: int | None) -> JobMatch:
-    with _db() as conn:
-        _fetch(conn, user_id, match_id)
-        conn.execute(
-            "UPDATE job_matches SET optimized_resume = ?, optimized_score = ?, "
-            "updated_at = ? WHERE id = ? AND user_id = ?",
-            (resume_text, score, _now(), match_id, user_id),
+    with session_scope() as session:
+        row = _fetch(session, user_id, match_id)
+        return JobMatchDetail(
+            **_to_match(row).model_dump(),
+            jd_text=row.jd_text,
+            optimized_resume=row.optimized_resume,
         )
-        row = _fetch(conn, user_id, match_id)
-    return _to_match(row)
+
+
+def store_optimized(
+    user_id: int,
+    match_id: int,
+    resume_text: str,
+    score: int | None,
+    stored_file: storage.StoredFile | None = None,
+) -> JobMatch:
+    """Save the tailored resume, replacing any earlier one for this posting."""
+    with session_scope() as session:
+        row = _fetch(session, user_id, match_id)
+        stale_key = row.optimized_key if stored_file else None
+
+        row.optimized_resume = resume_text
+        row.optimized_score = score
+        if stored_file:
+            row.optimized_key = stored_file.key
+            row.optimized_url = stored_file.url
+        row.updated_at = db.utcnow()
+        session.flush()
+        match = _to_match(row)
+
+    if stale_key and stored_file and stale_key != stored_file.key:
+        storage.delete(stale_key)
+    return match
 
 
 def rename(user_id: int, match_id: int, company: str | None, title: str | None) -> JobMatch:
-    fields: dict = {}
-    if company is not None:
-        fields["company"] = company.strip()
-    if title is not None:
-        fields["title"] = title.strip()
-    if not fields:
+    if company is None and title is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Nothing to update.")
 
-    fields["updated_at"] = _now()
-    assignments = ", ".join(f"{name} = ?" for name in fields)
-
-    with _db() as conn:
-        row = _fetch(conn, user_id, match_id)
+    with session_scope() as session:
+        row = _fetch(session, user_id, match_id)
         # Keep the stored summary in step with the edited values.
-        summary = _loads(row["role_summary"], {})
-        if company is not None:
-            summary["company"] = fields["company"]
-        if title is not None:
-            summary["title"] = fields["title"]
+        summary = dict(row.role_summary) if isinstance(row.role_summary, dict) else {}
 
-        conn.execute(
-            f"UPDATE job_matches SET {assignments}, role_summary = ? WHERE id = ? AND user_id = ?",
-            (*fields.values(), json.dumps(summary), match_id, user_id),
-        )
-        row = _fetch(conn, user_id, match_id)
-    return _to_match(row)
+        if company is not None:
+            row.company = company.strip()
+            summary["company"] = row.company
+        if title is not None:
+            row.title = title.strip()
+            summary["title"] = row.title
+
+        row.role_summary = summary
+        row.updated_at = db.utcnow()
+        session.flush()
+        return _to_match(row)
 
 
 def delete(user_id: int, match_id: int) -> None:
-    with _db() as conn:
-        _fetch(conn, user_id, match_id)
-        conn.execute(
-            "DELETE FROM job_matches WHERE id = ? AND user_id = ?", (match_id, user_id)
-        )
+    with session_scope() as session:
+        row = _fetch(session, user_id, match_id)
+        key = row.optimized_key
+        session.delete(row)
+    if key:
+        storage.delete(key)

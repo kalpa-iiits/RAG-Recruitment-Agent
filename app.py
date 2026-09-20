@@ -21,14 +21,17 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import auth
+import db
 import job_match
+import pdf
 import profiles
 import resumes
+import storage
 from agents import ResumeAnalysisAgent
 from auth import User, get_current_user
 
@@ -393,12 +396,29 @@ def _extension(upload: UploadFile) -> str:
     return (upload.filename or "").rsplit(".", 1)[-1].lower()
 
 
+def _store_generated_pdf(
+    user_id: int, text: str, kind: str, title: str, filename: str
+) -> storage.StoredFile | None:
+    """Typeset a generated resume and put it in S3.
+
+    Returns None when S3 is off or either step fails — a stored copy is a
+    convenience, and losing it must not fail the request that produced it.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        document = pdf.render_resume_pdf(text, title=title)
+    except Exception as e:
+        logger.warning("Could not render %s PDF for user %s: %s", kind, user_id, e)
+        return None
+    return storage.upload(
+        user_id=user_id, data=document, kind=kind, filename=filename
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    auth.init_db()
-    resumes.init_db()
-    profiles.init_db()
-    job_match.init_db()
+    db.init_db()
     yield
     with _sessions_lock:
         sessions = list(_sessions.values())
@@ -508,14 +528,16 @@ def analyze(
         else:
             session.agent.api_key = api_key
 
+        # Read once: the same bytes are parsed for text and sent to S3.
+        resume_buffer = _to_named_buffer(resume)
+        jd_buffer = _to_named_buffer(job_description) if job_description else None
+
         try:
-            if job_description is not None:
-                result = session.agent.analyze_resume(
-                    _to_named_buffer(resume), custom_jd=_to_named_buffer(job_description)
-                )
+            if jd_buffer is not None:
+                result = session.agent.analyze_resume(resume_buffer, custom_jd=jd_buffer)
             else:
                 result = session.agent.analyze_resume(
-                    _to_named_buffer(resume), role_requirements=ROLE_REQUIREMENTS[role]
+                    resume_buffer, role_requirements=ROLE_REQUIREMENTS[role]
                 )
         except Exception as e:
             raise HTTPException(500, f"Error analyzing resume: {e}")
@@ -528,7 +550,27 @@ def analyze(
         session.interview_questions = None
         session.qa_history = []
 
-        # Keep a durable copy; the session itself expires.
+        # Keep a durable copy; the session itself expires. The PDF goes to S3
+        # when it is configured, and returns None otherwise.
+        stored_file = storage.upload(
+            user_id=user.id,
+            data=resume_buffer.getvalue(),
+            kind=storage.KIND_ORIGINAL,
+            filename=resume.filename or "resume.pdf",
+        )
+        jd_file = None
+        if jd_buffer is not None and job_description is not None:
+            jd_file = storage.upload(
+                user_id=user.id,
+                data=jd_buffer.getvalue(),
+                kind=storage.KIND_JOB_DESCRIPTION,
+                filename=job_description.filename or "job-description.pdf",
+                content_type=(
+                    "application/pdf"
+                    if _extension(job_description) == "pdf"
+                    else "text/plain"
+                ),
+            )
         try:
             session.saved_resume_id = resumes.save_analysis(
                 user_id=user.id,
@@ -536,6 +578,8 @@ def analyze(
                 role=role or "",
                 resume_text=session.agent.resume_text or "",
                 analysis=result,
+                stored_file=stored_file,
+                jd_file=jd_file,
             )
         except Exception as e:
             # A storage failure shouldn't lose the analysis the user paid for.
@@ -619,6 +663,17 @@ def rename_job_match(
 ):
     """Correct the company or role, e.g. when the posting didn't name them."""
     return job_match.rename(user.id, match_id, body.company, body.title)
+
+
+@api.get("/job-match/{match_id}/download")
+def download_job_resume(match_id: int, user: User = Depends(get_current_user)):
+    """Redirect to a freshly signed link for the tailored resume PDF."""
+    saved = job_match.get_detail(user.id, match_id)
+    if not saved.optimized_url:
+        raise HTTPException(404, "No tailored resume has been generated for this job.")
+    return RedirectResponse(
+        saved.optimized_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT
+    )
 
 
 @api.delete("/job-match/{match_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -714,7 +769,14 @@ def generate_job_resume(
                 # The resume is still useful even if re-scoring fails.
                 logger.warning("Could not re-score tailored resume %s: %s", match_id, e)
 
-    return job_match.store_optimized(user.id, match_id, tailored, score)
+    stored_file = _store_generated_pdf(
+        user_id=user.id,
+        text=tailored,
+        kind=storage.KIND_TAILORED,
+        title=f"{saved.title or 'Tailored resume'} — {saved.company}".strip(" —"),
+        filename="tailored-resume.pdf",
+    )
+    return job_match.store_optimized(user.id, match_id, tailored, score, stored_file)
 
 
 @api.get("/resume")
@@ -839,9 +901,32 @@ def improvements(
 
 
 @api.get("/improved-resume")
-def get_improved_resume(session: Session = Depends(get_session)):
-    """The cached rewrite, so reloading the page doesn't trigger another LLM call"""
-    return {"improved_resume": session.improved_resume}
+def get_improved_resume(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """The cached rewrite, so reloading the page doesn't trigger another LLM call.
+
+    Falls back to the copy stored against the saved resume, so the rewrite
+    (and its PDF) survive the session expiring.
+    """
+    text = session.improved_resume
+    download_url = None
+    resume_id = session.saved_resume_id
+
+    if resume_id:
+        try:
+            saved = resumes.get_detail(user.id, resume_id)
+            text = text or saved.improved_text
+            download_url = saved.improved_url
+        except Exception as e:
+            logger.warning("Could not read stored rewrite %s: %s", resume_id, e)
+
+    return {
+        "improved_resume": text,
+        "resume_id": resume_id,
+        "download_url": download_url,
+    }
 
 
 @api.post("/improved-resume")
@@ -849,6 +934,7 @@ def improved_resume(
     body: ImprovedResumeRequest,
     api_key: str = Depends(get_api_key),
     session: Session = Depends(require_analyzed),
+    user: User = Depends(get_current_user),
 ):
     with session.lock:
         session.agent.api_key = api_key
@@ -860,7 +946,30 @@ def improved_resume(
             raise HTTPException(500, f"Error creating improved resume: {e}")
 
         session.improved_resume = improved
-        return {"improved_resume": improved}
+        resume_id = session.saved_resume_id
+
+    # Outside the lock: rendering and uploading are slow and touch nothing the
+    # session owns. Neither is allowed to cost the user the rewrite itself.
+    download_url = None
+    if resume_id:
+        try:
+            stored_file = _store_generated_pdf(
+                user_id=user.id,
+                text=improved,
+                kind=storage.KIND_IMPROVED,
+                title=body.target_role or "Improved resume",
+                filename="improved-resume.pdf",
+            )
+            resumes.attach_improved(user.id, resume_id, improved, stored_file)
+            download_url = stored_file.url if stored_file else None
+        except Exception as e:
+            logger.warning("Could not store rewrite for user %s: %s", user.id, e)
+
+    return {
+        "improved_resume": improved,
+        "resume_id": resume_id,
+        "download_url": download_url,
+    }
 
 
 @api.post("/improved-resume/apply")
