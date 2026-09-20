@@ -1030,8 +1030,38 @@ class ResumeAnalysisAgent:
                 7. Ensuring all relevant experience is properly emphasized
                 8. Adding measurable outcomes and achievements
 
-                Return only the improved resume text without any additional explanations.
-                Format the resume in a modern, clean style with clear section headings.
+                Return only the improved resume text, with no commentary before or
+                after it. Keep it tight enough to set on a single page: prefer
+                fewer, stronger bullets over more of them.
+
+                Format it as plain text with light markdown, in exactly this shape:
+
+                Full Name
+                Role | Role | Key skills
+                City, Country | email | phone | linkedin | github
+
+                ## PROFESSIONAL SUMMARY
+                Three or four lines of prose, no bullets.
+
+                ## PROFESSIONAL EXPERIENCE
+                **Job Title - Company (Mon YYYY - Mon YYYY)**
+                *City, Country*
+                - Achievement, with a number in it wherever one is honest.
+                - **Technologies:** comma-separated list
+
+                ## TECHNICAL SKILLS
+                **Category:** comma-separated list, one category per line
+
+                ## CERTIFICATIONS
+                - One per line
+
+                ## EDUCATION
+                **Degree, Field (YYYY - YYYY)**
+                *Institution*
+
+                The first three lines are the header and carry no markdown. Every
+                section heading is a `##` line in upper case. Bullets start with
+                `- `. No tables, no columns, no horizontal rules, no page numbers.
                 """
 
             response = llm.invoke(prompt)
