@@ -593,9 +593,36 @@ def analyze(
 
 
 @api.get("/analysis")
-def get_analysis(session: Session = Depends(get_session)):
-    """The user's latest analysis, so a page reload can restore state"""
-    return {"analysis_result": session.analysis_result}
+def get_analysis(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """The user's latest analysis, so a page reload can restore state.
+
+    Sessions live in this process, so a restart or an idle hour empties
+    them — but the analysis itself is a row in the resumes table, and is
+    read back here rather than sending the user off to re-upload a resume
+    that has already been scored.
+
+    `active` reports whether the session still holds the agent that the
+    generative features need. Restoring the analysis costs nothing;
+    rebuilding that agent re-embeds the resume, so it stays on demand
+    through POST /api/resumes/{id}/activate.
+    """
+    resume_id = session.saved_resume_id
+    if session.analysis_result is None:
+        restored = resumes.latest_analysis(user.id)
+        if restored:
+            resume_id, analysis = restored
+            with session.lock:
+                session.analysis_result = analysis
+                session.saved_resume_id = resume_id
+
+    return {
+        "analysis_result": session.analysis_result,
+        "resume_id": resume_id,
+        "active": session.agent is not None,
+    }
 
 
 @api.post("/resumes/{resume_id}/activate")

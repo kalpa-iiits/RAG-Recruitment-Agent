@@ -275,6 +275,26 @@ def ids_for_user(user_id: int) -> list[int]:
         )
 
 
+def latest_analysis(user_id: int) -> tuple[int, dict] | None:
+    """The newest stored analysis for this user, and the row it came from.
+
+    A session holds the working analysis in memory, which a restart or an
+    idle hour empties, while the analysis itself has been on this table all
+    along. Reading it back is what stops the dashboard asking for another
+    upload of a resume that has already been analysed.
+    """
+    with session_scope() as session:
+        row = session.execute(
+            select(db.Resume.id, db.Resume.analysis)
+            .where(db.Resume.user_id == user_id, db.Resume.analysis.is_not(None))
+            .order_by(db.Resume.updated_at.desc(), db.Resume.id.desc())
+            .limit(1)
+        ).first()
+    if row is None or not row.analysis:
+        return None
+    return row.id, row.analysis
+
+
 def count_for_user(session, user_id: int) -> int:
     return session.scalar(
         select(func.count()).select_from(db.Resume).where(db.Resume.user_id == user_id)
