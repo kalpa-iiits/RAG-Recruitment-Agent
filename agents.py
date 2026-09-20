@@ -95,13 +95,34 @@ class ResumeAnalysisAgent:
         vectorstore = FAISS.from_texts([text], embeddings)
         return vectorstore
 
-    def build_retrieval_chain(self, retriever, model=None):
-        """Build an LCEL retrieval chain: invoke with {"input": ...} -> {"answer": ...}"""
-        prompt = ChatPromptTemplate.from_template(
-            "Answer the question using only the context below.\n\n"
-            "Context:\n{context}\n\n"
-            "Question: {input}"
-        )
+    def build_retrieval_chain(self, retriever, model=None, extra_context=""):
+        """Build an LCEL retrieval chain: invoke with {"input": ...} -> {"answer": ...}
+
+        `extra_context` is static text prepended to the retrieved documents —
+        used by Q&A to supply the analysis, which is not in the vector store.
+        """
+        if extra_context:
+            # Braces in the text would be read as template variables.
+            safe = extra_context.replace("{", "{{").replace("}", "}}")
+            template = (
+                "You are helping a candidate understand their own resume.\n"
+                "Answer using the resume analysis and the resume excerpts below.\n"
+                "The analysis is authoritative for scores, strengths and weaknesses — "
+                "when asked about weaknesses, gaps or areas to improve, answer from it "
+                "and never claim the information is unavailable.\n"
+                "Quote concrete scores where they help. If something genuinely is not "
+                "covered by either source, say so briefly and answer what you can.\n\n"
+                f"Resume analysis:\n{safe}\n\n"
+                "Resume excerpts:\n{context}\n\n"
+                "Question: {input}"
+            )
+        else:
+            template = (
+                "Answer the question using only the context below.\n\n"
+                "Context:\n{context}\n\n"
+                "Question: {input}"
+            )
+        prompt = ChatPromptTemplate.from_template(template)
         combine_docs_chain = create_stuff_documents_chain(
             ChatOpenAI(model=model or self.model, api_key=self.api_key), prompt
         )
@@ -199,6 +220,57 @@ class ResumeAnalysisAgent:
 
         self.resume_weaknesses = weaknesses
         return weaknesses
+
+    def summarize_job_description(self, jd_text):
+        """Pull the headline facts out of a job description.
+
+        Returns company, title, experience, employment type, key skills and
+        nice-to-haves. Fields the posting doesn't state come back empty rather
+        than invented.
+        """
+        try:
+            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+            prompt = f"""
+                Read this job description and extract only what it actually states.
+
+                Return ONLY a JSON object, no prose and no markdown fences:
+                {{
+                  "company": "hiring company, or \"\" if not named",
+                  "title": "the role title",
+                  "experience": "years of experience asked for, e.g. \"5+ Years\", or \"\"",
+                  "employment_type": "Full-time, Contract, Internship etc., or \"\"",
+                  "key_skills": ["required skills, at most 6"],
+                  "nice_to_have": ["preferred but not required, at most 6"]
+                }}
+
+                Do not guess. If the posting does not state something, use an
+                empty string or an empty list.
+
+                Job Description:
+                {jd_text[:6000]}
+                """
+
+            raw = self._strip_json_fence(llm.invoke(prompt).content)
+
+            parsed = json.loads(raw)
+            return {
+                "company": str(parsed.get("company") or ""),
+                "title": str(parsed.get("title") or ""),
+                "experience": str(parsed.get("experience") or ""),
+                "employment_type": str(parsed.get("employment_type") or ""),
+                "key_skills": [str(x) for x in (parsed.get("key_skills") or [])][:6],
+                "nice_to_have": [str(x) for x in (parsed.get("nice_to_have") or [])][:6],
+            }
+        except Exception as e:
+            print(f"Could not summarize job description: {e}")
+            return {
+                "company": "",
+                "title": "",
+                "experience": "",
+                "employment_type": "",
+                "key_skills": [],
+                "nice_to_have": [],
+            }
 
     def extract_skills_from_jd(self, jd_text):
         """Extract skills from a job description"""
@@ -321,17 +393,279 @@ class ResumeAnalysisAgent:
 
         return self.analysis_result
 
+    def _analysis_context(self):
+        """The analysis as plain text.
+
+        The vector store only holds resume chunks, so without this the model
+        has no idea what its own scoring found and answers questions about
+        weaknesses with "the context doesn't mention any".
+        """
+        result = self.analysis_result or {}
+        if not result:
+            return ""
+
+        lines = []
+        score = result.get("overall_score")
+        if score is not None:
+            verdict = "at or above" if result.get("selected") else "below"
+            lines.append(
+                f"Overall ATS score: {score}/100 ({verdict} the cutoff of {self.cutoff_score})."
+            )
+
+        scores = result.get("skill_scores") or {}
+        if scores:
+            ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            lines.append(
+                "Skill scores out of 10: "
+                + ", ".join(f"{name} {value}/10" for name, value in ordered)
+            )
+
+        strengths = result.get("strengths") or []
+        if strengths:
+            lines.append("Strengths (scored 7 or above): " + ", ".join(strengths))
+
+        missing = result.get("missing_skills") or []
+        if missing:
+            lines.append(
+                "Weaknesses and gaps (scored 5 or below): " + ", ".join(missing)
+            )
+        else:
+            lines.append("No skill scored 5 or below, so there are no flagged gaps.")
+
+        for weakness in result.get("detailed_weaknesses") or []:
+            lines.append(
+                f"Weakness detail - {weakness.get('skill', '')} "
+                f"({weakness.get('score', 0)}/10): {weakness.get('detail', '')}"
+            )
+            for suggestion in weakness.get("suggestions") or []:
+                lines.append(f"  Suggestion: {suggestion}")
+
+        if self.extracted_skills:
+            lines.append(
+                "Skills the target role requires: " + ", ".join(self.extracted_skills)
+            )
+
+        return "\n".join(lines)
+
     def ask_question(self, question):
-        """Ask a question about the resume"""
+        """Ask a question about the resume and its analysis"""
         if not self.rag_vectorstore or not self.resume_text:
             return "Please analyze a resume first."
 
-        retriever = self.rag_vectorstore.as_retriever(search_kwargs={"k": 3})
-
-        qa_chain = self.build_retrieval_chain(retriever)
+        retriever = self.rag_vectorstore.as_retriever(search_kwargs={"k": 4})
+        qa_chain = self.build_retrieval_chain(
+            retriever, extra_context=self._analysis_context()
+        )
 
         response = qa_chain.invoke({"input": question})
         return response["answer"]
+
+    @staticmethod
+    def _strip_json_fence(raw, opener="{", closer="}"):
+        """Pull a JSON blob out of a model reply.
+
+        Models wrap JSON in ```json fences despite being told not to, which
+        makes json.loads fail and pushes callers into lossy fallbacks.
+        """
+        text = (raw or "").strip()
+        if text.startswith("```"):
+            parts = text.split("```")
+            if len(parts) > 1:
+                text = parts[1]
+            if text.lstrip().lower().startswith("json"):
+                text = text.lstrip()[4:]
+        start, end = text.find(opener), text.rfind(closer)
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+        return text.strip()
+
+    @staticmethod
+    def _match_question_type(returned, question_types):
+        """Map a model-returned type onto one of the requested types.
+
+        Models paraphrase ("Technical Knowledge", "coding challenge"), so match
+        case-insensitively in both directions. Returns None when nothing fits.
+        """
+        candidate = (returned or "").strip().lower()
+        if not candidate:
+            return None
+        for requested in question_types:
+            lowered = requested.lower()
+            if lowered == candidate or lowered in candidate or candidate in lowered:
+                return requested
+        return None
+
+    def generate_interview_questions_detailed(
+        self,
+        question_types,
+        difficulty,
+        num_questions,
+        focus_skills=None,
+        topics=None,
+        seniority="",
+        seniority_guidance="",
+        target_role="",
+    ):
+        """Interview questions with an expected answer and a hint for each.
+
+        Returns dicts of: type, topic, skill, question, expected_answer, hint.
+
+        `topics` sets the subject areas to cover (system design, the person's
+        own resume, challenges they hit, and so on) and `seniority` sets how
+        deep each one goes — a system design question for an SDE2 is a
+        different question from the same topic for an SDE1.
+        """
+        if not self.resume_text or not self.extracted_skills:
+            return []
+
+        skills = [s for s in (focus_skills or []) if s] or self.extracted_skills
+        topic_list = [t for t in (topics or []) if t]
+
+        try:
+            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+
+            context = f"""
+                Resume Content:
+                {self.resume_text[:2000]}...
+
+                Skills to focus on: {', '.join(skills)}
+
+                Strengths: {', '.join(self.analysis_result.get('strengths', []))}
+
+                Areas for improvement: {', '.join(self.analysis_result.get('missing_skills', []))}
+                """
+
+            if topic_list:
+                topic_block = (
+                    f"Cover these topics, spreading the questions across them as evenly "
+                    f"as the count allows:\n- " + "\n- ".join(topic_list)
+                )
+            else:
+                topic_block = ""
+
+            level_block = ""
+            if seniority:
+                level_block = f"Target level: {seniority}."
+                if seniority_guidance:
+                    level_block += f" {seniority_guidance}"
+                level_block += (
+                    " Pitch the depth, scope and expected answer to that level — the "
+                    "same topic should be asked differently at a different level."
+                )
+
+            role_block = f"Target role: {target_role}." if target_role else ""
+
+            # Spread the set across the requested types instead of letting the
+            # model settle on whichever one it finds easiest.
+            if len(question_types) > 1:
+                spread = (
+                    f"Distribute the {num_questions} questions across these types as evenly "
+                    f"as possible, and use every one of them at least once if "
+                    f"{num_questions} >= {len(question_types)}."
+                )
+            else:
+                spread = f"Every question must be of type \"{question_types[0]}\"."
+
+            prompt = f"""
+                Generate exactly {num_questions} personalized {difficulty.lower()} level
+                interview questions for this candidate. Use only these question types:
+                {', '.join(question_types)}.
+
+                {role_block}
+                {level_block}
+
+                {spread}
+
+                {topic_block}
+
+                {context}
+
+                Ground the set in this specific candidate:
+                - Ask at least one question about their actual background and career path
+                  ("Resume Deep-Dive" / "Career Motivation" topics), naming a real company,
+                  project or technology from the resume above.
+                - Ask at least one about a concrete challenge, failure or trade-off they
+                  faced, and what they would do differently.
+                - Never invent experience the resume does not mention.
+
+                Return ONLY a JSON array, no prose and no markdown fences. Each element:
+                {{
+                  "type": "one of: {', '.join(question_types)}",
+                  "topic": "the single topic from the list above this question covers",
+                  "skill": "the single skill from the focus list this question targets, or \"\" if none",
+                  "question": "the full question text",
+                  "expected_answer": "a strong answer in 2-4 sentences, pitched at the target level",
+                  "hint": "one sentence nudging the candidate in the right direction"
+                }}
+
+                For coding questions include a clear problem statement in the question text.
+                For system design questions state the scale and constraints to design for.
+                """
+
+            # A JSON array this time, so the fence stripper looks for brackets.
+            raw = self._strip_json_fence(llm.invoke(prompt).content, "[", "]")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                return []
+
+            questions = []
+            unmatched = 0
+            for item in parsed:
+                if not isinstance(item, dict) or not item.get("question"):
+                    continue
+
+                # Never report a type that wasn't asked for; fall back to the
+                # first requested type so the label stays truthful to the request.
+                matched = self._match_question_type(item.get("type"), question_types)
+                if matched is None:
+                    unmatched += 1
+                    matched = question_types[0]
+
+                # Same treatment as the type: never report a topic nobody asked for.
+                topic = ""
+                if topic_list:
+                    topic = self._match_question_type(item.get("topic"), topic_list) or ""
+                elif item.get("topic"):
+                    topic = str(item["topic"])
+
+                questions.append(
+                    {
+                        "type": matched,
+                        "topic": topic,
+                        "skill": str(item.get("skill") or ""),
+                        "question": str(item["question"]),
+                        "expected_answer": str(item.get("expected_answer") or ""),
+                        "hint": str(item.get("hint") or ""),
+                    }
+                )
+
+            if unmatched:
+                print(
+                    f"{unmatched} question(s) came back with a type outside "
+                    f"{question_types}; relabelled as {question_types[0]}."
+                )
+            return questions
+
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            print(f"Could not parse detailed interview questions: {e}")
+            # Fall back to the older tuple-based generator so the user still
+            # gets questions, just without answers or hints.
+            return [
+                {
+                    "type": t,
+                    "topic": "",
+                    "skill": "",
+                    "question": q,
+                    "expected_answer": "",
+                    "hint": "",
+                }
+                for t, q in self.generate_interview_questions(
+                    question_types, difficulty, num_questions
+                )
+            ]
+        except Exception as e:
+            print(f"Error generating detailed interview questions: {e}")
+            return []
 
     def generate_interview_questions(self, question_types, difficulty, num_questions):
         """Generate interview questions based on the resume"""
@@ -525,10 +859,20 @@ class ResumeAnalysisAgent:
                 # Try to parse JSON from the response
                 ai_improvements = {}
                 try:
-                    ai_improvements = json.loads(response.content)
-                    improvements.update(ai_improvements)
-                except json.JSONDecodeError:
-                    pass
+                    ai_improvements = json.loads(
+                        self._strip_json_fence(response.content)
+                    )
+                    if not isinstance(ai_improvements, dict):
+                        ai_improvements = {}
+
+                    # Only keep areas that were actually requested, so a stray
+                    # fence or brace can never surface as a heading in the UI.
+                    for key, value in ai_improvements.items():
+                        area = self._match_question_type(key, remaining_areas)
+                        if area and isinstance(value, dict):
+                            improvements[area] = value
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    ai_improvements = {}
 
                 # If JSON parsing failed, create structured output manually
                 if not ai_improvements:
@@ -542,9 +886,20 @@ class ResumeAnalysisAgent:
                         area = None
 
                         for line in lines:
-                            if not area and line.strip():
-                                area = line.strip()
-                                improvements[area] = {"description": "", "specific": []}
+                            stripped = line.strip()
+                            # Skip fences and bare punctuation from a failed JSON reply.
+                            if stripped.startswith("```") or stripped in ("{", "}", "[", "]", ""):
+                                continue
+                            if not area:
+                                matched = self._match_question_type(
+                                    stripped.strip("#*: "), remaining_areas
+                                )
+                                if not matched:
+                                    continue
+                                area = matched
+                                improvements.setdefault(
+                                    area, {"description": "", "specific": []}
+                                )
                             elif area and "specific" in improvements[area]:
                                 if line.strip().startswith("- "):
                                     improvements[area]["specific"].append(
