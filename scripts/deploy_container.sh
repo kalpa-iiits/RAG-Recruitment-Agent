@@ -94,7 +94,7 @@ if [ ! -f "${ENV_FILE}" ]; then
 fi
 
 echo "Starting the container..."
-# Bound to loopback, not 0.0.0.0: nginx terminates TLS and proxies to it, so
+# Bound to loopback, not 0.0.0.0: nginx terminates TLS and proxies to it,so
 # publishing the port on every interface would put the API on the public
 # internet on :8501, unencrypted and around the proxy.
 # The data volume outlives the container. Without it a SQLite deployment
