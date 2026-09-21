@@ -440,8 +440,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Recruitment Agent", version="1.0.0", lifespan=lifespan)
 
-# Origins allowed to call the API from another port/domain (e.g. a React dev
-# server).
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
