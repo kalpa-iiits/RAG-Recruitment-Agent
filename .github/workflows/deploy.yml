@@ -178,7 +178,8 @@ jobs:
           --name "$CONTAINER_NAME" \
           -p 127.0.0.1:8501:8501 \
           --restart always \
-          --env-file /opt/cvexpert/.env \ 
+          --env-file /opt/cvexpert/.env \
+          -e JWT_SECRET \
           -v resume-agent-data:/app/data \
           "$NEW_IMAGE"
 
