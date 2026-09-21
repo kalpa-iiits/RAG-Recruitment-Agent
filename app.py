@@ -311,7 +311,14 @@ SENIORITY_LEVELS = {
 }
 
 
-QUESTION_TYPES = ["Basic", "Technical", "Experience", "Scenario", "Coding", "Behavioral"]
+QUESTION_TYPES = [
+    "Basic",
+    "Technical",
+    "Experience",
+    "Scenario",
+    "Coding",
+    "Behavioral",
+]
 IMPROVEMENT_AREAS = [
     "Content",
     "Format",
@@ -358,7 +365,9 @@ def _evict_expired_sessions():
     now = time.monotonic()
     with _sessions_lock:
         expired = [
-            uid for uid, s in _sessions.items() if now - s.last_seen > SESSION_TTL_SECONDS
+            uid
+            for uid, s in _sessions.items()
+            if now - s.last_seen > SESSION_TTL_SECONDS
         ]
         removed = [_sessions.pop(uid) for uid in expired]
     for session in removed:
@@ -383,7 +392,8 @@ def get_api_key(x_openai_api_key: str | None = Header(default=None)) -> str:
 def require_analyzed(session: Session = Depends(get_session)) -> Session:
     if not (session.agent and session.analysis_result):
         raise HTTPException(
-            409, "Please upload and analyze a resume first in the 'Resume Analysis' tab."
+            409,
+            "Please upload and analyze a resume first in the 'Resume Analysis' tab.",
         )
     return session
 
@@ -414,9 +424,7 @@ def _store_generated_pdf(
     except Exception as e:
         logger.warning("Could not render %s PDF for user %s: %s", kind, user_id, e)
         return None
-    return storage.upload(
-        user_id=user_id, data=document, kind=kind, filename=filename
-    )
+    return storage.upload(user_id=user_id, data=document, kind=kind, filename=filename)
 
 
 @asynccontextmanager
@@ -439,7 +447,8 @@ app.add_middleware(
     allow_origins=[
         o.strip()
         for o in os.getenv(
-            "CORS_ORIGINS", "http://localhost:5173,http://localhost:3000"
+            "CORS_ORIGINS",
+            "http://localhost:5173,http://localhost:3000,http://www.cvexpert.in,http://cvexpert.in,https://www.cvexpert.in,https://cvexpert.in,http://www.cvexpert.in.s3-website-ap-southeast-2.amazonaws.com/,http://cvexpert.in.s3-website-ap-southeast-2.amazonaws.com/",
         ).split(",")
         if o.strip()
     ],
@@ -521,14 +530,19 @@ def analyze(
 ):
     if _extension(resume) != "pdf":
         raise HTTPException(400, "Resume must be a PDF.")
-    if job_description is not None and _extension(job_description) not in ("pdf", "txt"):
+    if job_description is not None and _extension(job_description) not in (
+        "pdf",
+        "txt",
+    ):
         raise HTTPException(400, "Job description must be a PDF or TXT file.")
     if job_description is None and role not in ROLE_REQUIREMENTS:
         raise HTTPException(400, "Select a valid role or upload a job description.")
 
     with session.lock:
         if session.agent is None:
-            session.agent = ResumeAnalysisAgent(api_key=api_key, cutoff_score=CUTOFF_SCORE)
+            session.agent = ResumeAnalysisAgent(
+                api_key=api_key, cutoff_score=CUTOFF_SCORE
+            )
         else:
             session.agent.api_key = api_key
 
@@ -538,7 +552,9 @@ def analyze(
 
         try:
             if jd_buffer is not None:
-                result = session.agent.analyze_resume(resume_buffer, custom_jd=jd_buffer)
+                result = session.agent.analyze_resume(
+                    resume_buffer, custom_jd=jd_buffer
+                )
             else:
                 result = session.agent.analyze_resume(
                     resume_buffer, role_requirements=ROLE_REQUIREMENTS[role]
@@ -644,7 +660,9 @@ def activate_saved_resume(
 
     with session.lock:
         if session.agent is None:
-            session.agent = ResumeAnalysisAgent(api_key=api_key, cutoff_score=CUTOFF_SCORE)
+            session.agent = ResumeAnalysisAgent(
+                api_key=api_key, cutoff_score=CUTOFF_SCORE
+            )
         else:
             session.agent.api_key = api_key
 
@@ -750,7 +768,9 @@ def analyze_job_match(
         except Exception as e:
             raise HTTPException(500, f"Could not read that job description: {e}")
         if not skills:
-            raise HTTPException(422, "No skills could be read from that job description.")
+            raise HTTPException(
+                422, "No skills could be read from that job description."
+            )
 
         try:
             result = agent.semantic_skill_analysis(agent.resume_text, skills)
@@ -854,12 +874,8 @@ def ask(
             raise HTTPException(500, f"Error: {e}")
 
         now = datetime.now(timezone.utc).isoformat()
-        session.qa_history.append(
-            {"role": "user", "content": body.question, "at": now}
-        )
-        session.qa_history.append(
-            {"role": "assistant", "content": answer, "at": now}
-        )
+        session.qa_history.append({"role": "user", "content": body.question, "at": now})
+        session.qa_history.append({"role": "assistant", "content": answer, "at": now})
         # Keep the transcript bounded; it lives in memory.
         del session.qa_history[:-60]
 
