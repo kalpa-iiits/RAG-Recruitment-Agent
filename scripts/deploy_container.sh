@@ -97,8 +97,13 @@ echo "Starting the container..."
 # Bound to loopback, not 0.0.0.0: nginx terminates TLS and proxies to it, so
 # publishing the port on every interface would put the API on the public
 # internet on :8501, unencrypted and around the proxy.
+# The data volume outlives the container. Without it a SQLite deployment
+# writes into the container's own filesystem, and every redeploy silently
+# starts from an empty database — the rows are not lost so much as never
+# looked at again. Harmless when DATABASE_URL points at Postgres.
 docker run -d --name streamlit-container -p 127.0.0.1:8501:8501 --restart always \
     --env-file "${ENV_FILE}" \
+    -v resume-agent-data:/app/data \
     ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
 
 echo "Deployment completed successfully!"
