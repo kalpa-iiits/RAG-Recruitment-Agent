@@ -78,7 +78,27 @@ echo "Pulling the latest image from ECR..."
 docker pull ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
 
 # Run the container
+#
+# Runtime config lives on the host: .dockerignore keeps .env out of every
+# image layer, so nothing in the image supplies it. Started without this,
+# the container comes up looking healthy and fails quietly — no
+# OPENAI_API_KEY (the UI then asks each user for their own), a JWT_SECRET
+# regenerated per process (every deploy logs everyone out), and a SQLite
+# file inside the container that the next deploy throws away. Better to
+# refuse to start than to serve that.
+ENV_FILE=${ENV_FILE:-/opt/cvexpert/.env}
+if [ ! -f "${ENV_FILE}" ]; then
+    echo "ERROR: ${ENV_FILE} not found — create it before deploying." >&2
+    echo "       See backend/.env.example for the variables it must set." >&2
+    exit 1
+fi
+
 echo "Starting the container..."
-docker run -d --name streamlit-container -p 8501:8501 --restart always ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+# Bound to loopback, not 0.0.0.0: nginx terminates TLS and proxies to it, so
+# publishing the port on every interface would put the API on the public
+# internet on :8501, unencrypted and around the proxy.
+docker run -d --name streamlit-container -p 127.0.0.1:8501:8501 --restart always \
+    --env-file "${ENV_FILE}" \
+    ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
 
 echo "Deployment completed successfully!"
