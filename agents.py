@@ -925,18 +925,121 @@ class ResumeAnalysisAgent:
                 for area in improvement_areas
             }
 
-    def get_improved_resume(self, target_role="", highlight_skills=""):
-        """Generate an improved version of the resume optimized for the job description"""
+    @staticmethod
+    def _keyword_present(keyword, text):
+        """Whether `keyword` appears in `text` as a whole term, ignoring case.
+
+        Plain substring matching would count "Java" inside "JavaScript", so
+        the match must not be flanked by letters or digits.
+        """
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return True
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(keyword) + r"(?![A-Za-z0-9])"
+        return re.search(pattern, text or "", re.IGNORECASE) is not None
+
+    def _absent_keywords(self, text, keywords):
+        return [k for k in keywords if not self._keyword_present(k, text)]
+
+    @staticmethod
+    def _add_to_skills_section(resume, keywords):
+        """Append `keywords` to the TECHNICAL SKILLS section as a last resort.
+
+        Guarantees every keyword appears verbatim when the model still left
+        some out after being asked twice.
+        """
+        line = "**Additional:** " + ", ".join(keywords)
+        lines = resume.split("\n")
+        start = next(
+            (
+                i
+                for i, l in enumerate(lines)
+                if l.strip().startswith("##") and "SKILLS" in l.upper()
+            ),
+            None,
+        )
+        if start is None:
+            return resume.rstrip() + "\n\n## TECHNICAL SKILLS\n" + line + "\n"
+
+        end = next(
+            (i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("##")),
+            len(lines),
+        )
+        # Insert after the section's last non-blank line, keeping the gap
+        # before the next heading.
+        insert_at = end
+        while insert_at > start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, line)
+        return "\n".join(lines)
+
+    def _ensure_keywords(self, resume, keywords, llm):
+        """Make sure every required keyword made it into the rewrite."""
+        absent = self._absent_keywords(resume, keywords)
+        if not absent:
+            return resume
+
+        prompt = f"""
+            The resume below is missing these required keywords, which an ATS
+            scanner looks for verbatim: {', '.join(absent)}
+
+            Revise the resume so each of them appears, spelled exactly as given,
+            at least once. Work each one into the most natural place: an
+            experience bullet or the professional summary where the candidate's
+            work plausibly involved it, otherwise the TECHNICAL SKILLS section.
+            Do not invent new employers, job titles, dates, degrees or
+            certifications. Keep everything else, including the format, as is.
+
+            Return only the revised resume text, with no commentary.
+
+            Resume:
+            {resume}
+            """
+        try:
+            revised = llm.invoke(prompt).content.strip()
+            # A reply that lost most of the resume is worse than the original.
+            if revised and len(revised) >= 0.7 * len(resume):
+                resume = revised
+        except Exception as e:
+            print(f"Could not revise resume for missing keywords: {e}")
+
+        still_absent = self._absent_keywords(resume, keywords)
+        if still_absent:
+            resume = self._add_to_skills_section(resume, still_absent)
+        return resume
+
+    def get_improved_resume(
+        self, target_role="", highlight_skills="", missing_keywords=None, jd_text=None
+    ):
+        """Generate an improved version of the resume optimized for the job description
+
+        `missing_keywords` must all appear in the result. Left as None, the
+        analysis' missing skills are used. `jd_text` overrides the job
+        description from the analysis, for tailoring to a different posting.
+        """
         if not self.resume_text:
             return "Please upload and analyze a resume first."
 
         try:
+            if missing_keywords is None:
+                missing_keywords = (self.analysis_result or {}).get("missing_skills", [])
+            # De-duplicate case-insensitively, keeping the first spelling.
+            required_keywords, seen = [], set()
+            for keyword in missing_keywords:
+                keyword = (keyword or "").strip()
+                if keyword and keyword.lower() not in seen:
+                    seen.add(keyword.lower())
+                    required_keywords.append(keyword)
+
+            jd_for_prompt = jd_text if jd_text is not None else self.jd_text
+
             # Parse highlight skills if provided
             skills_to_highlight = []
             if highlight_skills:
 
                 if len(highlight_skills) > 100:
                     self.jd_text = highlight_skills
+                    jd_for_prompt = highlight_skills
                     try:
                         parsed_skills = self.extract_skills_from_jd(highlight_skills)
                         if parsed_skills:
@@ -956,9 +1059,24 @@ class ResumeAnalysisAgent:
                         s.strip() for s in highlight_skills.split(",") if s.strip()
                     ]
 
+            # Skills the user asked for that the original resume lacks are
+            # missing keywords too.
+            for skill in self._absent_keywords(self.resume_text, skills_to_highlight):
+                if skill.lower() not in seen:
+                    seen.add(skill.lower())
+                    required_keywords.append(skill)
+
             if not skills_to_highlight and self.analysis_result:
 
-                skills_to_highlight = self.analysis_result.get("missing_skills", [])
+                # Copy, so extending below doesn't grow the stored analysis.
+                skills_to_highlight = list(required_keywords)
+                skills_to_highlight.extend(
+                    [
+                        skill
+                        for skill in self.analysis_result.get("missing_skills", [])
+                        if skill not in skills_to_highlight
+                    ]
+                )
 
                 skills_to_highlight.extend(
                     [
@@ -999,11 +1117,23 @@ class ResumeAnalysisAgent:
                             f"For {skill_name}: {weakness['example']}\n\n"
                         )
 
+            keyword_context = ""
+            if required_keywords:
+                keyword_context = (
+                    "Required keywords - every one of these MUST appear in the "
+                    "rewrite, spelled exactly as written here, at least once: "
+                    f"{', '.join(required_keywords)}\n"
+                    "Work each into an experience bullet or the professional summary "
+                    "where the candidate's work plausibly involved it; otherwise list "
+                    "it under TECHNICAL SKILLS. Do not invent employers, job titles, "
+                    "dates, degrees or certifications to fit them in.\n"
+                )
+
             llm = ChatOpenAI(model=self.model, temperature=0.7, api_key=self.api_key)
 
             jd_context = ""
-            if self.jd_text:
-                jd_context = f"Job Description:\n{self.jd_text}\n\n"
+            if jd_for_prompt:
+                jd_context = f"Job Description:\n{jd_for_prompt}\n\n"
             elif target_role:
                 jd_context = f"Target Role: {target_role}\n\n"
 
@@ -1015,6 +1145,8 @@ class ResumeAnalysisAgent:
 
                 Skills to highlight (in order of priority): {', '.join(skills_to_highlight)}
 
+                {keyword_context}
+
                 {weakness_context}
 
                 Here are specific examples of content to add:
@@ -1022,7 +1154,8 @@ class ResumeAnalysisAgent:
 
                 Please improve the resume by:
                 1. Adding strong, quantifiable achievements
-                2. Highlighting the specified skills strategically for ATS scanning
+                2. Highlighting the specified skills strategically for ATS scanning,
+                   including every required keyword listed above
                 3. Addressing all the weakness areas identified with the specific suggestions provided
                 4. Incorporating the example improvements provided above
                 5. Structuring information in a clear, professional format
@@ -1065,7 +1198,9 @@ class ResumeAnalysisAgent:
                 """
 
             response = llm.invoke(prompt)
-            improved_resume = response.content.strip()
+            improved_resume = self._ensure_keywords(
+                response.content.strip(), required_keywords, llm
+            )
 
             with tempfile.NamedTemporaryFile(
                 delete=False, suffix=".txt", mode="w", encoding="utf-8"

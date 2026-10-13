@@ -813,9 +813,13 @@ def generate_job_resume(
         agent.api_key = api_key
 
         try:
+            # Passed as a list: joined into a string it would read as a job
+            # description past 100 characters and be re-extracted, losing the
+            # exact keywords. The posting's own text replaces the analysis JD.
             tailored = agent.get_improved_resume(
                 target_role=saved.title or "",
-                highlight_skills=", ".join(saved.missing_skills),
+                missing_keywords=saved.missing_skills,
+                jd_text=saved.jd_text,
             )
         except Exception as e:
             raise HTTPException(500, f"Could not generate the tailored resume: {e}")
