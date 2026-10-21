@@ -9,6 +9,7 @@ of an analysis stay in a JSON column, which becomes JSONB on Postgres so it
 can be indexed and queried into later.
 """
 
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -68,6 +69,28 @@ def _normalise(url: str) -> str:
 DATABASE_URL = _normalise(os.getenv("DATABASE_URL", "").strip() or DEFAULT_SQLITE_URL)
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
+# The RDS-managed secret holding the master password. When set, the password
+# is read from Secrets Manager for each new connection instead of from
+# DATABASE_URL or PGPASSWORD, because RDS rotates it (every 7 days) and a
+# copy in the environment goes stale the moment it does.
+DB_SECRET_ID = os.getenv("DB_SECRET_ID", "").strip()
+
+_db_password: str | None = None
+
+
+def _secret_password(refresh: bool = False) -> str:
+    """The current password, fetched once and again only after a rotation."""
+    global _db_password
+    if _db_password is None or refresh:
+        import boto3  # imported late: only needed when the secret is configured
+
+        client = boto3.client(
+            "secretsmanager", region_name=os.getenv("AWS_REGION") or None
+        )
+        secret = client.get_secret_value(SecretId=DB_SECRET_ID)
+        _db_password = json.loads(secret["SecretString"])["password"]
+    return _db_password
+
 
 def _engine_kwargs() -> dict:
     if IS_SQLITE:
@@ -96,6 +119,25 @@ if IS_SQLITE:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys = ON")
         cursor.close()
+
+elif DB_SECRET_ID:
+
+    @event.listens_for(engine, "do_connect")
+    def _password_from_secret(dialect, _record, cargs, cparams):
+        """Connect with the cached password; after a rotation, refetch once.
+
+        Connections already in the pool keep working through a rotation, so
+        only a new one notices, and only that one pays for the refetch.
+        """
+        cparams["password"] = _secret_password()
+        try:
+            return dialect.connect(*cargs, **cparams)
+        except dialect.loaded_dbapi.OperationalError as exc:
+            if "password authentication failed" not in str(exc):
+                raise
+            logger.info("Database password was rotated; refetching it")
+            cparams["password"] = _secret_password(refresh=True)
+            return dialect.connect(*cargs, **cparams)
 
 
 @contextmanager

@@ -88,6 +88,13 @@ once in `db.py` as SQLAlchemy models. `DATABASE_URL` picks the backend:
 `postgres://` and `postgresql://` are both rewritten to the `psycopg` driver,
 so an RDS connection string can be pasted in unchanged.
 
+When RDS manages the master password in Secrets Manager, it rotates it every
+7 days, so a password copied into `.env` stops working at the next rotation.
+Set `DB_SECRET_ID` to the secret's ARN instead and leave the password out of
+`DATABASE_URL`: each new connection reads it from Secrets Manager (cached, and
+refetched once if the database rejects it). The instance role needs
+`secretsmanager:GetSecretValue` on that secret.
+
 Free-form data — a resume's analysis, a profile's preferences, a job match's
 skill lists — lives in JSON columns, which become **JSONB** on Postgres and
 can be indexed and queried into:
