@@ -83,10 +83,36 @@ once in `db.py` as SQLAlchemy models. `DATABASE_URL` picks the backend:
 | Value | Backend |
 | --- | --- |
 | unset | SQLite at `data/cvexpert.db` — zero setup, for local work |
-| `postgresql://user:pass@host:5432/cvexpert?sslmode=require` | Postgres / Amazon RDS |
+| `postgresql://postgres.REF:pass@aws-0-REGION.pooler.supabase.com:5432/postgres?sslmode=require` | Supabase (session pooler) |
+| `postgresql://user:pass@host:5432/cvexpert?sslmode=require` | Any other Postgres, e.g. Amazon RDS |
 
 `postgres://` and `postgresql://` are both rewritten to the `psycopg` driver,
-so an RDS connection string can be pasted in unchanged.
+so a Supabase or RDS connection string can be pasted in unchanged.
+
+On Supabase, use the **session pooler** string (port 5432): the direct
+connection is IPv6-only, which EC2 usually can't reach. The transaction
+pooler (port 6543) also works — prepared statements are switched off
+automatically for it. On startup every table gets row-level security
+enabled with no policies, which keeps Supabase's public REST API from
+reading them; the app connects as the table owner and is unaffected.
+
+#### Moving from RDS to Supabase
+
+Run from a machine that can reach RDS (the EC2 instance). The `postgres:17`
+image avoids a `pg_dump` older than the server:
+
+```bash
+docker run --rm -v "$PWD:/dump" postgres:17 pg_dump "$RDS_URL" \
+  --format=custom --no-owner --no-acl --schema=public -f /dump/cvexpert.dump
+docker run --rm -v "$PWD:/dump" postgres:17 pg_restore -d "$SUPABASE_URL" \
+  --no-owner --no-acl --schema=public /dump/cvexpert.dump
+```
+
+Restore into a fresh project before the app has started against it, so the
+tables don't already exist. Then set `DATABASE_URL` in `/opt/cvexpert/.env`
+to the Supabase string, empty `DB_SECRET_ID`, and redeploy (or
+`docker restart streamlit-container`). Compare row counts on both sides
+before deleting the RDS instance, and take a final snapshot when you do.
 
 When RDS manages the master password in Secrets Manager, it rotates it every
 7 days, so a password copied into `.env` stops working at the next rotation.

@@ -2,7 +2,8 @@
 
 Every table in the app is defined here. `DATABASE_URL` picks the backend:
 the default SQLite file keeps local development zero-setup, and a
-`postgresql+psycopg://` URL points the identical schema at Amazon RDS.
+`postgresql+psycopg://` URL points the identical schema at Postgres —
+Supabase in production (Amazon RDS before it).
 
 Anything the app filters or sorts on is a real column; the free-form parts
 of an analysis stay in a JSON column, which becomes JSONB on Postgres so it
@@ -32,6 +33,7 @@ from sqlalchemy import (
     event,
     func,
     inspect,
+    make_url,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -69,6 +71,10 @@ def _normalise(url: str) -> str:
 DATABASE_URL = _normalise(os.getenv("DATABASE_URL", "").strip() or DEFAULT_SQLITE_URL)
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
+# Supabase's pooler listens on 5432 in session mode and 6543 in transaction
+# mode; only the latter needs prepared statements switched off.
+SUPABASE_TRANSACTION_POOLER_PORT = 6543
+
 # The RDS-managed secret holding the master password. When set, the password
 # is read from Secrets Manager for each new connection instead of from
 # DATABASE_URL or PGPASSWORD, because RDS rotates it (every 7 days) and a
@@ -97,14 +103,20 @@ def _engine_kwargs() -> dict:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         # FastAPI serves requests on a threadpool, so connections cross threads.
         return {"connect_args": {"check_same_thread": False}}
-    return {
-        # RDS drops idle connections and reboots during maintenance windows;
-        # without these a pooled connection comes back dead.
+    kwargs = {
+        # Managed Postgres drops idle connections and restarts for
+        # maintenance; without these a pooled connection comes back dead.
         "pool_pre_ping": True,
         "pool_recycle": 1800,
         "pool_size": 5,
         "max_overflow": 10,
     }
+    if make_url(DATABASE_URL).port == SUPABASE_TRANSACTION_POOLER_PORT:
+        # Supavisor in transaction mode hands each transaction to whichever
+        # server connection is free, so a statement psycopg prepared on one
+        # is missing on the next ("prepared statement ... does not exist").
+        kwargs["connect_args"] = {"prepare_threshold": None}
+    return kwargs
 
 
 engine = create_engine(DATABASE_URL, echo=False, future=True, **_engine_kwargs())
@@ -157,7 +169,7 @@ def session_scope() -> Iterator[Session]:
 # --- Column types -----------------------------------------------------------
 
 # JSON everywhere, JSONB on Postgres: same Python dicts, but indexable and
-# queryable server-side once this runs on RDS.
+# queryable server-side on Postgres.
 JSONColumn = JSON().with_variant(JSONB, "postgresql")
 
 TZDateTime = DateTime(timezone=True)
@@ -387,10 +399,27 @@ def _ensure_email_index() -> None:
         )
 
 
+def _enable_row_level_security() -> None:
+    """Close every table to Supabase's auto-generated REST API.
+
+    Supabase publishes the public schema over PostgREST to anyone holding
+    the project's anon key, which would include users.password_hash. RLS
+    with no policies denies those roles everything, while the app's own
+    connection owns the tables and so is not subject to RLS at all.
+    Harmless on any other Postgres; re-enabling is a no-op.
+    """
+    if IS_SQLITE:
+        return
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            conn.execute(text(f"ALTER TABLE {table.name} ENABLE ROW LEVEL SECURITY"))
+
+
 def init_db() -> None:
     """Create anything missing. Safe to call on every boot."""
     _rename_username_to_email()
     Base.metadata.create_all(engine)
     _add_missing_columns()
     _ensure_email_index()
+    _enable_row_level_security()
     logger.info("Database ready: %s", engine.url.render_as_string(hide_password=True))
